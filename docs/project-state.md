@@ -1,6 +1,6 @@
 # Project state & handoff
 
-**Last updated:** 2026-10-22. Read this first when picking the project back up. It records what has been built, why, how it was verified, and what is still open. The rest of `docs/` describes *how things work*; this page describes *where things stand*.
+**Last updated:** 2026-10-27. Read this first when picking the project back up. It records what has been built, why, how it was verified, and what is still open. The rest of `docs/` describes *how things work*; this page describes *where things stand*.
 
 > ⚠ **This folder is not a git repository**, so there is no history to diff or revert against. The user chose to **leave git out for now** (2026-10-21): don't initialise it or suggest it. Back up a file (e.g. to the scratchpad) before a risky edit instead.
 
@@ -29,10 +29,18 @@ A local crypto analysis desk: a TradingView chart plus an AI analyst. The FastAP
 - **Snapshot truncation (the most impactful fix):** `market.py:context_to_prompt_block` used to pretty-print about 6.5k characters and cut at 5k, which **dropped `confluence` and `setup`**, so the AI never saw the score it was meant to respect. It now uses compact JSON, drops empty values, puts the decision fields first, caps at 8k, and drops low-value sections whole. Typical size is now about 4.5k. Verified: Claude now quotes the score ("SCORE: 8.6/10").
 - **Reward:risk:**
   - `binance_ta.py` local levels: stop ATR bands and min target R come from each strategy's `RiskProfile` (desk default 0.75 to 2 ATR, 2R). Live-review stance bands are strategy-owned too (WL-053).
-  - `main.py:_apply_reward_risk_guard`: a Buy/Sell with levels on the wrong side of entry, or below 1:1, becomes Neutral.
+  - `main.py:_apply_reward_risk_guard`: a Buy/Sell with levels on the wrong side of entry, or below strategy min R:R (desk 1.5:1), becomes Neutral.
+  - Soft confluence band is |score| < 3.0; trap/squeeze and pack-quality guards (WL-055). Dual spot/futures books; verify walks the signal TF.
   - The prompt asks for at least 1.5R.
   - **All strategies** (WL-054): Desk can run every pack with `optimize_mode` `local_score` / `majority_vote` / `ai_ensemble`; packs land in `multi_analysis_json`; detail at `#/signals/{id}`; live review may append revised SL/TP without changing the original plan.
+  - **Backtests** (WL-056): offline shallow/deep replay; rankings boost `pack_score` when n ≥ 20; Backtests page in the rail.
+  - **Hot** (WL-069): `#/hot` volatility scanner for Majors / Mid / Alts (local `hot_score`, optional AI brief, Open on Desk). Distinct from Watchlist setup quality and from the open WL-042 hype radar.
+  - **Extra packs** (WL-079, 2026-10-27): Crowded Fade, Range Fade, Session Box, Fair Value Gap, and Day Fade (intraday fade of obvious technical levels). Catalog is 14 named packs plus Desk. `GET /api/strategies` on the running API includes them.
+  - **Neutral archive** (WL-080, 2026-10-27): Full analyses that finish Neutral are stored with `status: "neutral"` and shown on Signals → Neutral, never mixed with Buy/Sell trades or trade KPIs.
+  - **Signal detail context** (WL-077): each archive stores slim `market_context_json` with `decision_levels`; detail page shows whales/liquidity/structure and auto-draws entry/SL/TP/S/R/Fib/trend on a first-party candle chart (`GET .../tape`).
 - **`DESK OVERRIDE:` line:** added to the reply when the guardrails change the model's bias, so the text and the plan never disagree silently.
+- **Guard mode** (WL-063 / decision 0009): Desk **Guards** select; `guard_mode=enforce` (default) or `ai_only` (keep model bias/levels, no post-AI override).
+- **Strategy risk / entries** (WL-064): wider stop ATR bands + `stop_buffer_atr`; `entry_style` market/limit/reclaim so plans are not always the analysis print. Live review adds entry waiting/filled, level advice (entry/SL/TP), and optional AI reasoning.
 - **Offline plans are no longer archived as signals.** Only real AI calls go into the track record.
 - **Symbol search:** `<q>USDT` ranks first, the selected exchange's pairs come before other venues, and the bogus `ALL:` pseudo-exchange from the TradingView coin list is dropped.
 

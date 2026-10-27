@@ -16,8 +16,23 @@ from .config import Settings
 from .market import context_to_prompt_block, fetch_coin_context_async
 from .schemas import TradeLevels
 from .strategies import get_strategy, list_strategies
+from .traps import apply_pack_quality_guard, apply_trap_guard, classify_traps
 
 logger = logging.getLogger(__name__)
+
+
+def _with_traps(market: dict[str, Any]) -> dict[str, Any]:
+    """Promote dual books and attach trap classification (WL-055)."""
+    book = market.get("orderbook") if isinstance(market.get("orderbook"), dict) else {}
+    updates: dict[str, Any] = {}
+    if "orderbook_spot" not in market and isinstance(book.get("orderbook_spot"), dict):
+        updates["orderbook_spot"] = book["orderbook_spot"]
+    if "orderbook_futures" not in market and isinstance(book.get("orderbook_futures"), dict):
+        updates["orderbook_futures"] = book["orderbook_futures"]
+    m = {**market, **updates} if updates else market
+    if isinstance(m.get("traps"), dict) and m["traps"].get("summary") is not None:
+        return m
+    return {**m, "traps": classify_traps(m)}
 
 OptimizeMode = Literal["local_score", "ai_ensemble", "majority_vote"]
 OPTIMIZE_MODES: tuple[str, ...] = ("local_score", "ai_ensemble", "majority_vote")
@@ -106,8 +121,8 @@ def _reward_risk(levels: TradeLevels) -> float:
     return abs(levels.take_profit - levels.entry) / risk
 
 
-def pack_score(levels: TradeLevels, market: dict[str, Any]) -> float:
-    """Higher is better. Neutrals score very low."""
+def pack_score(levels: TradeLevels, market: dict[str, Any], *, strategy_id: str | None = None) -> float:
+    """Higher is better. Neutrals score very low. Ranking boost when n >= 20 (WL-056)."""
     if levels.bias not in ("Buy", "Sell"):
         return -100.0
     fit = abs(_fit_score(market))
@@ -123,7 +138,15 @@ def pack_score(levels: TradeLevels, market: dict[str, Any]) -> float:
         align = 1.0
     elif abs(fs) < 0.5:
         align = 0.25
-    return fit + rr + conf * 2.0 + allowed + align
+    boost = 0.0
+    if strategy_id:
+        try:
+            from .backtests import ranking_boost
+
+            boost = ranking_boost(strategy_id)
+        except Exception:  # noqa: BLE001
+            boost = 0.0
+    return fit + rr + conf * 2.0 + allowed + align + boost
 
 
 def pack_public(
@@ -195,6 +218,26 @@ def pick_majority_vote(packs: list[dict[str, Any]]) -> tuple[dict[str, Any] | No
     )
 
 
+def _pack_apply_guards(
+    levels: TradeLevels,
+    market: dict[str, Any],
+    *,
+    strategy,
+    apply_confluence,
+    apply_rr,
+    guard_mode: str,
+) -> TradeLevels:
+    """Apply confluence / pack quality / traps / R:R unless ai_only (WL-063)."""
+    if guard_mode == "ai_only":
+        return levels
+    if strategy.uses_desk_pipeline:
+        levels = apply_confluence(levels, market)
+    else:
+        levels = apply_pack_quality_guard(levels, market)
+    levels = apply_trap_guard(levels, market)
+    return apply_rr(levels, min_rr=strategy.risk.min_reward_risk)
+
+
 async def _analyze_pack_ai(
     *,
     pair: str,
@@ -206,6 +249,7 @@ async def _analyze_pack_ai(
     fill_levels,
     apply_confluence,
     apply_rr,
+    guard_mode: str = "enforce",
 ) -> tuple[TradeLevels, dict[str, Any], str, str]:
     strategy = get_strategy(strategy_id)
     market = await fetch_coin_context_async(pair, exchange, desk_tf, settings, strategy.id)
@@ -224,13 +268,23 @@ async def _analyze_pack_ai(
         stop_atr_min=risk.stop_atr_min,
         stop_atr_max=risk.stop_atr_max,
         min_reward_risk=risk.min_reward_risk,
+        guard_mode=guard_mode,
+        stop_buffer_atr=risk.stop_buffer_atr,
+        entry_style=risk.entry_style,
+        entry_offset_atr=risk.entry_offset_atr,
     )
     text, provider = await generate_text(prompt, settings)
     levels = extract_levels(text)
     levels = fill_levels(levels, market)
-    if strategy.uses_desk_pipeline:
-        levels = apply_confluence(levels, market)
-    levels = apply_rr(levels)
+    market = _with_traps(market)
+    levels = _pack_apply_guards(
+        levels,
+        market,
+        strategy=strategy,
+        apply_confluence=apply_confluence,
+        apply_rr=apply_rr,
+        guard_mode=guard_mode,
+    )
     analysis = format_clear_brief(pair, exchange.upper(), effective_tf, levels, text)
     market = {**market, "timeframe": effective_tf}
     return levels, market, analysis, provider
@@ -246,15 +300,22 @@ async def _analyze_pack_local(
     fill_levels,
     apply_confluence,
     apply_rr,
+    guard_mode: str = "enforce",
 ) -> tuple[TradeLevels, dict[str, Any], str, str]:
     strategy = get_strategy(strategy_id)
     market = await fetch_coin_context_async(pair, exchange, desk_tf, settings, strategy.id)
     effective_tf = str(market.get("timeframe") or desk_tf)
     levels = levels_from_market(market)
     levels = fill_levels(levels, market)
-    if strategy.uses_desk_pipeline:
-        levels = apply_confluence(levels, market)
-    levels = apply_rr(levels)
+    market = _with_traps(market)
+    levels = _pack_apply_guards(
+        levels,
+        market,
+        strategy=strategy,
+        apply_confluence=apply_confluence,
+        apply_rr=apply_rr,
+        guard_mode=guard_mode,
+    )
     analysis = (
         f"LOCAL PACK {strategy.label}: bias {levels.bias}; "
         f"fit {_fit_score(market):+.1f}; R:R {_reward_risk(levels):.2f}"
@@ -274,6 +335,7 @@ async def run_multi_analyze(
     fill_levels,
     apply_confluence,
     apply_rr,
+    guard_mode: str = "enforce",
 ) -> dict[str, Any]:
     """Return final levels, packs, winner market, analysis text, provider meta."""
     ids = catalog_strategy_ids()
@@ -293,6 +355,7 @@ async def run_multi_analyze(
                 fill_levels=fill_levels,
                 apply_confluence=apply_confluence,
                 apply_rr=apply_rr,
+                guard_mode=guard_mode,
             )
         else:
             levels, market, analysis, provider = await _analyze_pack_local(
@@ -304,8 +367,9 @@ async def run_multi_analyze(
                 fill_levels=fill_levels,
                 apply_confluence=apply_confluence,
                 apply_rr=apply_rr,
+                guard_mode=guard_mode,
             )
-        score = pack_score(levels, market)
+        score = pack_score(levels, market, strategy_id=strategy.id)
         pub = pack_public(
             strategy_id=strategy.id,
             strategy_label=strategy.label,
@@ -426,7 +490,8 @@ async def run_multi_analyze(
                 final_market = {}
                 final_sid = "desk"
                 reason = "ai_ensemble: synthesis only"
-            final_levels = apply_rr(final_levels)
+            if guard_mode != "ai_only":
+                final_levels = apply_rr(final_levels)
             analysis = format_clear_brief(
                 pair, exchange.upper(), str(final_market.get("timeframe") or desk_tf), final_levels, text
             )

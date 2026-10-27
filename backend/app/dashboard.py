@@ -33,7 +33,13 @@ def _label_map() -> dict[str, str]:
     return {s["id"]: s["label"] for s in list_strategies()}
 
 
+def _trade_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop Neutral archives from performance cards (WL-080)."""
+    return [r for r in rows if (r.get("status") or "").lower() != "neutral"]
+
+
 def _bucket_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = _trade_rows(rows)
     closed = [r for r in rows if r.get("status") in ("win", "loss", "expired")]
     wins = [r for r in closed if r.get("status") == "win"]
     losses = [r for r in closed if r.get("status") == "loss"]
@@ -59,7 +65,7 @@ def _bucket_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_dashboard() -> dict[str, Any]:
-    rows = _load()
+    rows = _trade_rows(_load())
     labels = _label_map()
     overall = _bucket_stats(rows)
 

@@ -116,6 +116,7 @@ const STATUS: Record<string, [Tone, string]> = {
   be: ["neutral", "="],
   skipped: ["neutral", "⊘"],
   invalid: ["warn", "!"],
+  neutral: ["neutral", "="],
 };
 
 export function StatusPill({ status, title }: Readonly<{ status: string; title?: string }>) {

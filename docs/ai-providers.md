@@ -158,11 +158,12 @@ The provider only writes text. The backend then:
 2. **Fills gaps** in entry, stop, target, support, resistance and EMAs from the local `suggested_levels` (`_fill_levels_from_market`).
 3. **Applies the guardrail** (`_apply_confluence_guardrail`). The AI's bias is overridden when it disagrees with the deterministic [confluence score](features/confluence-score.md):
    - Setup blocked by the chop filter → **Neutral**, confidence capped at 40% (a model confidence of 0 stays 0, a missing one becomes 40%; WL-026).
-   - |score| < 2.5 → **Neutral**.
+   - |score| < 3.0 → **Neutral** (WL-055; was 2.5).
    - The opposite side of a Buy or Sell confluence is never allowed.
    - |score| ≥ 3.5 with an AI answer of Neutral → upgraded to the confluence bias.
    - Confidence is the average of the AI's figure and the confluence figure.
-4. **Checks reward:risk** (`_apply_reward_risk_guard`). A Buy or Sell becomes **Neutral** if its levels are on the wrong side of the entry (a Buy needs stop < entry < target) or if it pays less than **1:1**. The prompt asks for the strategy's `min_reward_risk` and a stop within that pack's `stop_atr_min`..`stop_atr_max` ATR (desk default about 1.5:1 and 0.75 to 2 ATR; WL-053).
-5. **Formats** the desk card (`format_clear_brief`). If steps 3 or 4 changed the model's bias, a `DESK OVERRIDE:` line is added at the top of the reply, so the text and the plan never disagree silently.
+4. **Trap/squeeze and pack quality** (WL-055). Buying into a long-cascade / crowded-long trap, or selling into a short-squeeze / crowded-short trap, becomes **Neutral** (strong confluence plus agreeing book can override). Named packs with `trade_allowed=false` or |fit| under 2.0 become Neutral.
+5. **Checks reward:risk** (`_apply_reward_risk_guard`). A Buy or Sell becomes **Neutral** if its levels are on the wrong side of the entry (a Buy needs stop < entry < target) or if it pays less than the strategy **`min_reward_risk`** (desk floor **1.5:1**; WL-055). The prompt asks for that floor and a stop within that pack's `stop_atr_min`..`stop_atr_max` ATR (WL-053).
+6. **Formats** the desk card (`format_clear_brief`). If steps 3 to 5 changed the model's bias, a `DESK OVERRIDE:` line is added at the top of the reply, so the text and the plan never disagree silently.
 
 The AI explains and plans; it cannot overturn the score.

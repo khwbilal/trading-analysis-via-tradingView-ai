@@ -13,6 +13,7 @@ import {
   api,
   type ChatMessage,
   type Market,
+  type GuardMode,
   type OptimizeMode,
   type StrategyInfo,
   type StrategyPackResult,
@@ -36,6 +37,19 @@ const OPTIMIZE_OPTIONS: { id: OptimizeMode; label: string; hint: string }[] = [
   { id: "local_score", label: "Local score", hint: "Score every pack locally; optional short AI brief on the winner." },
   { id: "majority_vote", label: "Majority vote", hint: "Vote Buy/Sell/Neutral across packs; highest-fit agreeing pack supplies levels." },
   { id: "ai_ensemble", label: "Full AI ensemble", hint: "AI on every pack plus one synthesis pass (highest cost)." },
+];
+
+const GUARD_OPTIONS: { id: GuardMode; label: string; hint: string }[] = [
+  {
+    id: "enforce",
+    label: "Guards on",
+    hint: "Confluence, R:R and traps may override the model bias (default).",
+  },
+  {
+    id: "ai_only",
+    label: "AI only",
+    hint: "Keep the model bias, entry, stop and target; no desk override.",
+  },
 ];
 
 function deskKpis(levels: TradeLevels | null, market: Market | null): KpiTile[] {
@@ -138,6 +152,7 @@ export default function Desk({
   const [strategies, setStrategies] = useState<StrategyInfo[]>([]);
   const [strategyId, setStrategyId] = useState("desk");
   const [optimizeMode, setOptimizeMode] = useState<OptimizeMode>("local_score");
+  const [guardMode, setGuardMode] = useState<GuardMode>("enforce");
   const [packs, setPacks] = useState<StrategyPackResult[] | null>(null);
   const [optimizeReason, setOptimizeReason] = useState<string | null>(null);
   const [finalStrategyId, setFinalStrategyId] = useState<string | null>(null);
@@ -209,9 +224,10 @@ export default function Desk({
     if (busy) return;
     setBusy(true);
     const optHint = allStrategies ? ` · ${OPTIMIZE_OPTIONS.find((o) => o.id === optimizeMode)?.label}` : "";
+    const guardHint = ` · ${GUARD_OPTIONS.find((o) => o.id === guardMode)?.label ?? guardMode}`;
     push({
       role: "user",
-      text: `Full analysis for ${exchange}:${symbol} (${timeframe}) · ${strategyLabel}${optHint}`,
+      text: `Full analysis for ${exchange}:${symbol} (${timeframe}) · ${strategyLabel}${optHint}${guardHint}`,
     });
     const pending = push({
       role: "assistant",
@@ -224,6 +240,7 @@ export default function Desk({
         exchange,
         timeframe,
         strategy_id: strategyId,
+        guard_mode: guardMode,
         ...(allStrategies ? { optimize_mode: optimizeMode } : {}),
       });
       drop(pending);
@@ -355,6 +372,22 @@ export default function Desk({
                 </Select>
               </FormControl>
             ) : null}
+            <FormControl size="small" sx={{ minWidth: 140 }}>
+              <InputLabel id="desk-guard-label">Guards</InputLabel>
+              <Select
+                labelId="desk-guard-label"
+                label="Guards"
+                value={guardMode}
+                onChange={(e) => setGuardMode(e.target.value as GuardMode)}
+                disabled={busy}
+              >
+                {GUARD_OPTIONS.map((o) => (
+                  <MenuItem key={o.id} value={o.id} title={o.hint}>
+                    {o.label}
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
             <ActionButton icon={<BookmarkAddOutlined />} disabled={!levels} onClick={() => void logToJournal()}>
               Log to journal
             </ActionButton>
@@ -364,25 +397,29 @@ export default function Desk({
           </>
         }
       />
-      {allStrategies ? (
-        <Typography variant="body2" sx={{ color: "text.secondary" }}>
-          {OPTIMIZE_OPTIONS.find((o) => o.id === optimizeMode)?.hint}
-          {optimizeReason ? ` · ${optimizeReason}` : ""}
-          {market?.recorded_signal_id ? (
-            <>
-              {" · "}
-              <Typography
-                component="a"
-                href={`#/signals/${market.recorded_signal_id}`}
-                variant="body2"
-                sx={{ color: "primary.main" }}
-              >
-                Open signal detail
-              </Typography>
-            </>
-          ) : null}
-        </Typography>
-      ) : null}
+      <Typography variant="body2" sx={{ color: "text.secondary" }}>
+        {GUARD_OPTIONS.find((o) => o.id === guardMode)?.hint}
+        {allStrategies ? (
+          <>
+            {" · "}
+            {OPTIMIZE_OPTIONS.find((o) => o.id === optimizeMode)?.hint}
+            {optimizeReason ? ` · ${optimizeReason}` : ""}
+          </>
+        ) : null}
+        {market?.recorded_signal_id ? (
+          <>
+            {" · "}
+            <Typography
+              component="a"
+              href={`#/signals/${market.recorded_signal_id}`}
+              variant="body2"
+              sx={{ color: "primary.main" }}
+            >
+              Open signal detail
+            </Typography>
+          </>
+        ) : null}
+      </Typography>
       {packNote ? (
         <Typography variant="body2" sx={{ color: "text.secondary" }}>
           {packNote}

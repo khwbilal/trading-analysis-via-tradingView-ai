@@ -12,6 +12,7 @@ One note per decision: what was chosen, when, and why. The code shows *how* thin
 | 0006 | [The unefy way of working, adapted](0006-unefy-way-of-working.md) |
 | 0007 | [SQLite for app data](0007-sqlite.md) |
 | 0008 | [The portal is React + MUI only](0008-react-mui-only.md) |
+| 0009 | [User chooses guard enforce vs AI-only on analyze](0009-guard-mode-choice.md) |
 
 ## Adding one
 

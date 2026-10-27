@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+from app.backtest_engine import _signal
 from app.binance_ta import (
     _bos_choch,
+    _day_levels,
     _equal_levels,
+    _fair_value_gaps,
     _fibonacci,
     _pivot_swings,
+    _session_box,
     build_suggested_levels,
     pick_indicator_blocks,
 )
+from app.market import _strategy_fit
 from app.strategies import get_strategy, list_strategies, resolve_timeframes, review_thresholds
 
 
-def test_catalog_has_desk_and_seven_templates():
+def test_catalog_has_desk_and_templates():
     ids = {s["id"] for s in list_strategies()}
     assert "desk" in ids
     for sid in (
@@ -24,11 +29,54 @@ def test_catalog_has_desk_and_seven_templates():
         "retracement",
         "scalping",
         "ema_volatility",
+        "simple_core",
+        "abcd",
+        "crowded_fade",
+        "range_fade",
+        "session_box",
+        "fvg",
+        "day_fade",
     ):
         assert sid in ids
     assert get_strategy(None).id == "desk"
     assert get_strategy("unknown").id == "desk"
     assert get_strategy("SMC").id == "smc"
+
+
+def test_abcd_playbook_and_risk():
+    s = get_strategy("abcd")
+    assert s.label == "AB=CD Harmonic"
+    assert s.primary_tf == "1h"
+    assert "fibonacci" in s.indicators and "swings" in s.indicators
+    rules = s.prompt_rules.lower()
+    assert "ab=cd" in rules
+    assert "neutral" in rules
+    assert "61.8" in s.prompt_rules
+    assert "completion" in rules or "d completion" in rules
+    assert s.risk.entry_style == "limit"
+    assert s.risk.stop_buffer_atr == 0.35
+    primary, ctx, overridden = resolve_timeframes(s, "15m")
+    assert primary == "1h" and "4h" in ctx and overridden is True
+
+
+def test_simple_core_playbook_and_risk():
+    s = get_strategy("simple_core")
+    assert s.label == "Simple Core"
+    assert s.primary_tf is None
+    assert s.uses_desk_pipeline is False
+    assert "ema" in s.indicators and "rsi" in s.indicators and "atr" in s.indicators
+    rules = s.prompt_rules.lower()
+    assert "ema20" in rules or "ema 20" in rules or "ema20" in s.prompt_rules.lower()
+    assert "rsi" in rules
+    assert "1.5" in s.prompt_rules
+    assert "8" in s.prompt_rules
+    r = s.risk
+    assert r.stop_atr_min == 1.4 and r.stop_atr_max == 1.6
+    assert r.min_reward_risk == 2.0 and r.target_r_min == 2.0
+    assert r.entry_style == "market"
+    # Follows desk TF
+    primary, context, overridden = resolve_timeframes(s, "4h")
+    assert primary == "4h" and overridden is False and context == []
 
 
 def test_resolve_timeframes_named_strategy_owns_primary():
@@ -77,12 +125,30 @@ def test_named_pack_fetches_every_needed_tf(monkeypatch):
         }
 
     monkeypatch.setattr(market, "compute_local_analysis", fake_local)
+    monkeypatch.setattr(
+        "app.orderbook.fetch_orderbook_imbalance",
+        lambda _p: {"available": True, "bias": "Bid", "imbalance": 0.1},
+    )
+    monkeypatch.setattr(
+        "app.flow.fetch_flow_snapshot",
+        lambda _p, _tf: {"available": True, "whale_bias": "Long", "whale_long_pct": 55.0},
+    )
+    monkeypatch.setattr(
+        "app.liquidity.fetch_liquidity_map",
+        lambda *_a, **_k: {"available": True, "bias": "Neutral"},
+    )
     settings = Settings(_env_file=None, ai_provider="none")
     ctx = market._build_named_strategy_pack("BTCUSDT", "BINANCE", "1h", settings, "smc")
     frames = (ctx.get("strategy_pack") or {}).get("timeframes") or {}
     assert set(frames.keys()) == {"15m", "1h", "4h"}
     assert set(calls) == {"15m", "1h", "4h"}
     assert (ctx.get("strategy_pack") or {}).get("needed_tfs") == ["15m", "1h", "4h"]
+
+    # Light packs used to skip flow/liquidity; Desk cards need them (WL-075).
+    light = market._build_named_strategy_pack("ZECUSDT", "BINANCE", "1h", settings, "simple_core")
+    assert (light.get("flow") or {}).get("available") is True
+    assert (light.get("liquidity") or {}).get("available") is True
+    assert (light.get("orderbook") or {}).get("available") is True
 
 
 def test_pivot_equal_bos_fib_on_fixed_series():
@@ -142,7 +208,15 @@ def test_risk_profiles_scalping_tighter_than_smc():
     assert bands["exit_loss_r"] == scalp.review_exit_loss_r
     catalog = {s["id"]: s for s in list_strategies()}
     assert "risk" in catalog["desk"]
-    assert catalog["scalping"]["risk"]["stop_atr_max"] == 1.0
+    assert catalog["scalping"]["risk"]["stop_atr_max"] == 1.5
+    assert catalog["scalping"]["risk"]["stop_buffer_atr"] == 0.25
+    assert catalog["pullback"]["risk"]["entry_style"] == "limit"
+    assert catalog["breakout"]["risk"]["entry_style"] == "market"
+    smc_rules = get_strategy("smc").prompt_rules.lower()
+    assert "unmitigated" in smc_rules or "invalidating swing" in smc_rules
+    assert "reclaim" in get_strategy("liquidity_sweep").prompt_rules.lower()
+    assert "mid-air" in get_strategy("pullback").prompt_rules.lower()
+    assert "liquidity hunt" in get_strategy("scalping").prompt_rules.lower()
 
 
 def test_build_suggested_levels_respects_atr_bands():
@@ -156,6 +230,8 @@ def test_build_suggested_levels_respects_atr_bands():
         stop_atr_min=0.5,
         stop_atr_max=1.0,
         target_r_min=1.5,
+        stop_buffer_atr=0.0,
+        entry_style="market",
     )
     risk = 100.0 - wide["stop_loss"]
     assert abs(risk - 2.0) < 1e-6  # 1.0 ATR * atr
@@ -169,9 +245,30 @@ def test_build_suggested_levels_respects_atr_bands():
         stop_atr_min=0.75,
         stop_atr_max=2.0,
         target_r_min=2.0,
+        stop_buffer_atr=0.0,
+        entry_style="market",
     )
     risk2 = 100.0 - tight_floor["stop_loss"]
     assert abs(risk2 - 1.5) < 1e-6  # 0.75 ATR floor
+
+
+def test_limit_entry_not_always_print():
+    lim = build_suggested_levels(
+        price=100.0,
+        trend="Bullish",
+        recent_high=108.0,
+        recent_low=94.0,
+        atr=2.0,
+        stop_atr_min=1.0,
+        stop_atr_max=2.5,
+        target_r_min=2.0,
+        entry_style="limit",
+        entry_offset_atr=0.5,
+        stop_buffer_atr=0.25,
+    )
+    assert lim["entry"] < 100.0
+    assert lim["entry_style"] == "limit"
+    assert lim["stop_loss"] < lim["entry"] < lim["take_profit"]
 
 
 def test_record_signal_writes_strategy_id():
@@ -199,3 +296,162 @@ def test_record_signal_writes_strategy_id():
     assert any(r.get("id") == sig["id"] for r in rows)
     desk_only = list_signals(limit=10, strategy_id="desk")
     assert all(r.get("id") != sig["id"] for r in desk_only)
+
+
+def test_new_packs_playbooks_and_timeframes():
+    fade = get_strategy("day_fade")
+    assert fade.primary_tf == "15m"
+    assert "5m" in fade.context_tfs and "1h" in fade.context_tfs
+    rules = fade.prompt_rules.lower()
+    assert "against the obvious technical" in rules
+    assert "prior day high" in rules or "prior utc day high" in rules
+    assert "neutral" in rules
+    assert fade.risk.entry_style == "reclaim"
+
+    crowded = get_strategy("crowded_fade")
+    assert "funding" in crowded.prompt_rules.lower()
+    assert crowded.needs_liquidity is True
+    primary, ctx, overridden = resolve_timeframes(crowded, "1d")
+    assert primary == "15m" and "1h" in ctx and overridden is True
+
+    box = get_strategy("session_box")
+    assert "session_box" in box.indicators
+    assert "asia" in box.prompt_rules.lower()
+    assert box.risk.entry_style == "market"
+
+    gap = get_strategy("fvg")
+    assert "fair_value_gaps" in gap.indicators
+    assert gap.risk.entry_style == "limit"
+    p, c, _ = resolve_timeframes(gap, "15m")
+    assert p == "15m" and c == ["1h", "4h"]
+
+    rng = get_strategy("range_fade")
+    assert "adx" in rng.prompt_rules.lower()
+    assert rng.primary_tf == "1h"
+
+
+def test_fair_value_gap_unfilled_bullish():
+    highs = [10.0, 14.0, 16.0, 15.0, 15.0]
+    lows = [8.0, 12.0, 13.0, 13.5, 13.5]
+    closes = [9.0, 13.5, 15.0, 14.5, 14.2]
+    gaps = _fair_value_gaps(highs, lows, closes)
+    assert gaps["available"] is True
+    nearest = gaps["nearest"]
+    assert nearest["side"] == "bullish"
+    assert nearest["bottom"] == 10.0
+    assert nearest["top"] == 13.0
+
+
+def test_session_box_and_day_rejection():
+    day0 = 20_000 * 86_400 * 1000
+    step = 900_000  # 15m
+    times = [day0 + i * step for i in range(40)]
+    highs = [100.0] * 32 + [101.0, 105.0, 106.0, 107.0, 108.0, 109.0, 110.0, 111.0]
+    lows = [99.0] * 32 + [100.0] * 8
+    closes = [99.5] * 32 + [100.5, 104.0, 104.0, 104.0, 104.0, 104.0, 104.0, 104.0]
+    box = _session_box(times, highs, lows, closes)
+    assert box["available"] is True
+    assert box["asia_high"] == 100.0
+    assert box["location"] == "above"
+    assert box["window"] == "london"
+
+    prior = (20_000 - 1) * 86_400 * 1000
+    hour = 3_600_000
+    day_times = [prior + h * hour for h in range(24)] + [day0 + h * hour for h in range(3)]
+    day_highs = [40.0] * 23 + [50.0] + [48.0, 49.0, 51.0]
+    day_lows = [30.0] * 24 + [45.0, 45.0, 46.0]
+    day_closes = [35.0] * 24 + [47.0, 48.0, 49.0]
+    levels = _day_levels(day_times, day_highs, day_lows, day_closes)
+    assert levels["available"] is True
+    assert levels["prior_day_high"] == 50.0
+    assert levels["reject_prior_high"] is True
+    assert levels["reject_prior_low"] is False
+
+
+def test_pack_fit_hints():
+    quiet = _strategy_fit(
+        "range_fade",
+        {"adx": {"value": 14}, "bollinger": {"percent_b": 0.05}, "relative_volume": 0.8},
+    )
+    assert quiet["bias"] == "Buy" and quiet["trade_allowed"] is True
+    trending = _strategy_fit(
+        "range_fade",
+        {"adx": {"value": 30}, "bollinger": {"percent_b": 0.05}, "relative_volume": 0.8},
+    )
+    assert trending["trade_allowed"] is False
+
+    sell = _strategy_fit(
+        "crowded_fade",
+        {"structure": {"bos": None, "bias": "Neutral"}},
+        flow={"whale_long_pct": 70, "funding_rate": 0.0004, "oi_change_pct": 5},
+    )
+    assert sell["bias"] == "Sell"
+    accepted = _strategy_fit(
+        "crowded_fade",
+        {"structure": {"bos": "bullish", "bias": "Bullish"}},
+        flow={"whale_long_pct": 70, "funding_rate": 0.0004, "oi_change_pct": 5},
+    )
+    assert accepted["trade_allowed"] is False
+
+    faded = _strategy_fit(
+        "day_fade",
+        {"day_levels": {"available": True, "reject_prior_high": True, "reject_prior_low": False}},
+    )
+    assert faded["bias"] == "Sell"
+
+    gap = _strategy_fit(
+        "fvg",
+        {
+            "structure": {"bias": "Bullish"},
+            "fair_value_gaps": {"nearest": {"side": "bullish", "top": 2, "bottom": 1}},
+        },
+    )
+    assert gap["bias"] == "Buy"
+    disagree = _strategy_fit(
+        "fvg",
+        {
+            "structure": {"bias": "Bearish"},
+            "fair_value_gaps": {"nearest": {"side": "bullish"}},
+        },
+    )
+    assert disagree["trade_allowed"] is False
+
+
+def test_backtest_session_and_day_fade_signals():
+    day0 = 20_000 * 86_400 * 1000
+    step = 900_000
+    n = 40
+    times = [day0 + i * step for i in range(n)]
+    closes = [100.0] * 32 + [100.0, 100.2, 100.2, 100.2, 100.2, 100.2, 101.5, 101.5]
+    highs = [100.4] * 32 + [100.5] * 6 + [102.0, 102.0]
+    lows = [99.6] * n
+    # Bar 38 (index 38) is the first close above the Asia high.
+    i = 38
+    ema = [100.0] * n
+    rsi = [50.0] * n
+    sig = _signal("session_box", i, closes, highs, lows, ema, ema, rsi, 1.0, times)
+    assert sig is not None and sig[0] == "Buy"
+    assert "Asia high" in sig[1]
+
+    # Against-technical: wick through the prior 20-bar high, close back inside, RSI rolls over.
+    fade_highs = [10.0] * 25
+    fade_lows = [9.0] * 25
+    fade_closes = [9.5] * 25
+    fade_highs[24] = 12.0
+    fade_closes[24] = 9.8
+    fade_rsi = [50.0] * 25
+    fade_rsi[23] = 72.0
+    fade_rsi[24] = 66.0
+    fade = _signal(
+        "day_fade",
+        24,
+        fade_closes,
+        fade_highs,
+        fade_lows,
+        [10.0] * 25,
+        [10.0] * 25,
+        fade_rsi,
+        0.4,
+    )
+    assert fade is not None and fade[0] == "Sell"
+    assert "against technical" in fade[1]

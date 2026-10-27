@@ -13,35 +13,8 @@ SPOT = "https://api.binance.com"
 FUTURES = "https://fapi.binance.com"
 
 
-def fetch_orderbook_imbalance(pair: str, limit: int = 50) -> dict[str, Any]:
-    """
-    Depth imbalance: (bid_qty - ask_qty) / (bid_qty + ask_qty) on top N levels.
-    Positive = more bids (buy pressure). Also reports best bid/ask spread.
-    """
-    symbol = pair.upper().replace(".P", "").replace("/", "")
-    out: dict[str, Any] = {"available": False, "symbol": symbol}
-
-    depth = None
-    source = None
-    endpoints = (
-        (f"{FUTURES}/fapi/v1/depth", "futures"),
-        (f"{SPOT}/api/v3/depth", "spot"),
-    )
-    for url, label in endpoints:
-        try:
-            with httpx.Client(timeout=12.0) as client:
-                r = client.get(url, params={"symbol": symbol, "limit": limit})
-                if r.status_code == 200:
-                    depth = r.json()
-                    source = label
-                    break
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("depth %s failed: %s", label, exc)
-
-    if not depth:
-        out["error"] = "depth unavailable"
-        return out
-
+def _depth_imbalance(depth: dict[str, Any], *, source: str, limit: int) -> dict[str, Any]:
+    out: dict[str, Any] = {"available": False, "source": source}
     bids = depth.get("bids") or []
     asks = depth.get("asks") or []
     if not bids or not asks:
@@ -58,7 +31,6 @@ def fetch_orderbook_imbalance(pair: str, limit: int = 50) -> dict[str, Any]:
     mid = (best_bid + best_ask) / 2
     spread_bps = ((best_ask - best_bid) / mid) * 10_000 if mid else None
 
-    # Top-of-book pressure (first 5 levels)
     top_b = sum(float(q) for _, q in bids[:5])
     top_a = sum(float(q) for _, q in asks[:5])
     top_total = top_b + top_a
@@ -70,13 +42,10 @@ def fetch_orderbook_imbalance(pair: str, limit: int = 50) -> dict[str, Any]:
     elif imbalance <= -0.12:
         bias = "Ask-heavy"
 
-    # Confluence-friendly points (-1..+1)
     points = max(-1.0, min(1.0, imbalance * 2.5))
-
     out.update(
         {
             "available": True,
-            "source": source,
             "limit": limit,
             "bid_qty": round(bid_qty, 4),
             "ask_qty": round(ask_qty, 4),
@@ -95,4 +64,50 @@ def fetch_orderbook_imbalance(pair: str, limit: int = 50) -> dict[str, Any]:
             ),
         }
     )
+    return out
+
+
+def _fetch_depth(url: str, symbol: str, limit: int) -> dict[str, Any] | None:
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            r = client.get(url, params={"symbol": symbol, "limit": limit})
+            if r.status_code == 200:
+                return r.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("depth failed %s: %s", url, exc)
+    return None
+
+
+def fetch_orderbook_imbalance(pair: str, limit: int = 50) -> dict[str, Any]:
+    """
+    Depth imbalance: (bid_qty - ask_qty) / (bid_qty + ask_qty) on top N levels.
+    Fetches futures and spot when possible (WL-055). Primary `orderbook` prefers futures.
+    """
+    symbol = pair.upper().replace(".P", "").replace("/", "")
+    out: dict[str, Any] = {"available": False, "symbol": symbol}
+
+    fut_raw = _fetch_depth(f"{FUTURES}/fapi/v1/depth", symbol, limit)
+    spot_raw = _fetch_depth(f"{SPOT}/api/v3/depth", symbol, limit)
+    fut = _depth_imbalance(fut_raw, source="futures", limit=limit) if fut_raw else {
+        "available": False,
+        "source": "futures",
+        "error": "depth unavailable",
+    }
+    spot = _depth_imbalance(spot_raw, source="spot", limit=limit) if spot_raw else {
+        "available": False,
+        "source": "spot",
+        "error": "depth unavailable",
+    }
+
+    primary = fut if fut.get("available") else spot
+    if not primary.get("available"):
+        out["error"] = "depth unavailable"
+        out["orderbook_futures"] = fut
+        out["orderbook_spot"] = spot
+        return out
+
+    out.update(primary)
+    out["symbol"] = symbol
+    out["orderbook_futures"] = fut
+    out["orderbook_spot"] = spot
     return out

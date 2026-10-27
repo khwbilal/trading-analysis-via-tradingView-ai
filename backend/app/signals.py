@@ -23,10 +23,14 @@ _ORDER = "ORDER BY COALESCE(created_at, '') DESC, seq ASC"
 
 # How many bars after signal to wait before marking expired
 DEFAULT_HORIZON_BARS = {
+    "5m": 96,  # ~8h
     "15m": 48,  # ~12h
+    "30m": 48,  # ~1d
     "1h": 48,  # ~2d
+    "2h": 42,  # ~3.5d
     "4h": 42,  # ~7d
     "1d": 21,  # ~3w
+    "1w": 12,  # ~12w
 }
 
 # Live review stance defaults (desk). Named strategies override via RiskProfile (WL-053).
@@ -71,10 +75,18 @@ def list_signals(
     limit: int = 80,
     symbol: str | None = None,
     strategy_id: str | None = None,
+    kind: str = "trades",
 ) -> list[dict[str, Any]]:
-    # Newest first; equal timestamps keep insertion order (as the old stable sort did).
+    """Newest first. kind=trades excludes Neutral archives; kind=neutral is only those; kind=all is both."""
     clauses: list[str] = []
     params: list[Any] = []
+    k = (kind or "trades").strip().lower()
+    if k not in ("trades", "neutral", "all"):
+        k = "trades"
+    if k == "trades":
+        clauses.append("LOWER(COALESCE(status, '')) != 'neutral'")
+    elif k == "neutral":
+        clauses.append("LOWER(COALESCE(status, '')) = 'neutral'")
     if symbol:
         sym = symbol.upper().replace(".P", "")
         clauses.append("REPLACE(COALESCE(symbol, ''), '.P', '') = ?")
@@ -109,6 +121,279 @@ def get_signal(signal_id: str) -> dict[str, Any] | None:
     return from_db(_TABLE, row) if row else None
 
 
+def delete_signal(signal_id: str) -> bool:
+    """Remove one signal row (live_review_json and multi_analysis_json go with it)."""
+    sid = (signal_id or "").strip()
+    if not sid:
+        return False
+    with connect() as conn:
+        cur = conn.execute(f"DELETE FROM {_TABLE} WHERE id = ?", (sid,))  # noqa: S608
+    return cur.rowcount > 0
+
+
+def _num(v: Any) -> float | None:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_decision_levels(
+    levels: dict[str, Any],
+    market: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Auto-draw list: plan + S/R + Fib (+ trend) from the analyze snapshot (WL-077)."""
+    market = market or {}
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, float]] = set()
+
+    def add(kind: str, label: str, price: Any) -> None:
+        p = _num(price)
+        if p is None or p <= 0:
+            return
+        key = (kind, round(p, 8))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"kind": kind, "label": label, "price": p})
+
+    add("entry", "Entry", levels.get("entry"))
+    add("stop", "Stop", levels.get("stop_loss"))
+    add("target", "Take profit", levels.get("take_profit"))
+
+    coin = market.get("coin_analysis") if isinstance(market.get("coin_analysis"), dict) else {}
+    sr = coin.get("support_resistance") if isinstance(coin.get("support_resistance"), dict) else {}
+    sug = coin.get("suggested_levels") if isinstance(coin.get("suggested_levels"), dict) else {}
+    # Condensed snapshot may already be flat level_hints / nearest_*
+    condensed_hints = market.get("level_hints") if isinstance(market.get("level_hints"), dict) else {}
+
+    add("support", "Support", sr.get("nearest_support") or sug.get("support") or market.get("nearest_support") or condensed_hints.get("support"))
+    add(
+        "resistance",
+        "Resistance",
+        sr.get("nearest_resistance") or sug.get("resistance") or market.get("nearest_resistance") or condensed_hints.get("resistance"),
+    )
+    add("support", "Support 2", sr.get("support_2") or sug.get("support_2") or condensed_hints.get("support_2"))
+    add(
+        "resistance",
+        "Resistance 2",
+        sr.get("resistance_2") or sug.get("resistance_2") or condensed_hints.get("resistance_2"),
+    )
+
+    trend = (
+        sug.get("trend_line")
+        or (coin.get("market_structure") or {}).get("trend_line")
+        or market.get("trend_line")
+        or condensed_hints.get("trend_line")
+    )
+    add("trend", "Trend line", trend)
+
+    fib = coin.get("fibonacci") if isinstance(coin.get("fibonacci"), dict) else None
+    if not fib or not fib.get("available"):
+        top_fib = market.get("fibonacci") if isinstance(market.get("fibonacci"), dict) else None
+        if top_fib and top_fib.get("available"):
+            fib = top_fib
+    if not fib or not fib.get("available"):
+        pack = market.get("strategy_pack") if isinstance(market.get("strategy_pack"), dict) else {}
+        frames = pack.get("timeframes") if isinstance(pack.get("timeframes"), dict) else {}
+        for block in frames.values():
+            if isinstance(block, dict) and isinstance(block.get("fibonacci"), dict) and block["fibonacci"].get("available"):
+                fib = block["fibonacci"]
+                break
+    if isinstance(fib, dict) and fib.get("available"):
+        levels_map = fib.get("levels") if isinstance(fib.get("levels"), dict) else {}
+        for ratio, px in levels_map.items():
+            add("fib", f"Fib {ratio}", px)
+
+    return out
+
+
+def archive_market_context(
+    levels: dict[str, Any],
+    market: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Slim market archive for Signal Detail cards + decision chart (WL-077)."""
+    if not market:
+        return None
+    try:
+        from .market import condense_market_context
+
+        slim = condense_market_context(market)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("condense market for signal failed: %s", exc)
+        slim = {}
+    if not isinstance(slim, dict):
+        slim = {}
+    # Prefer fib from coin_analysis / strategy_pack into a top-level block for the UI
+    coin = market.get("coin_analysis") if isinstance(market.get("coin_analysis"), dict) else {}
+    fib = coin.get("fibonacci") if isinstance(coin.get("fibonacci"), dict) else None
+    if not (fib and fib.get("available")):
+        pack = market.get("strategy_pack") if isinstance(market.get("strategy_pack"), dict) else {}
+        frames = pack.get("timeframes") if isinstance(pack.get("timeframes"), dict) else {}
+        for block in frames.values():
+            if isinstance(block, dict) and isinstance(block.get("fibonacci"), dict) and block["fibonacci"].get("available"):
+                fib = block["fibonacci"]
+                break
+    if fib and fib.get("available"):
+        slim["fibonacci"] = {
+            "available": True,
+            "levels": fib.get("levels"),
+            "nearest": fib.get("nearest"),
+            "swing_high": fib.get("swing_high"),
+            "swing_low": fib.get("swing_low"),
+        }
+    struct = coin.get("market_structure") if isinstance(coin.get("market_structure"), dict) else {}
+    if struct:
+        slim["structure"] = {
+            "trend": struct.get("trend") or market.get("trend"),
+            "trend_strength": struct.get("trend_strength"),
+            "note": struct.get("note"),
+        }
+    slim["decision_levels"] = build_decision_levels(levels, market)
+    # Drop huge strategy_pack frames from archive (already used to extract fib)
+    slim.pop("strategy_pack", None)
+    return slim
+
+
+def signal_tape(signal_id: str, bars: int = 120, *, live: bool = False) -> dict[str, Any] | None:
+    """OHLC for the decision chart (WL-077). live=True ends at now so Detail can poll (WL-078)."""
+    sig = get_signal(signal_id)
+    if not sig:
+        return None
+    bars = max(40, min(int(bars), 300))
+    symbol = str(sig.get("symbol") or "")
+    tf = normalize_timeframe(str(sig.get("timeframe") or "1h"))
+    created = _parse_ts(sig.get("created_at"))
+    if live:
+        end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    else:
+        end_ms = int((created or datetime.now(timezone.utc)).timestamp() * 1000) + 60_000
+    candles = _fetch_klines_ending(symbol, tf, end_ms=end_ms, limit=bars)
+    return {
+        "symbol": symbol,
+        "timeframe": tf,
+        "created_at": sig.get("created_at"),
+        "live": bool(live),
+        "candles": candles,
+        "decision_levels": (
+            (sig.get("market_context_json") or {}).get("decision_levels")
+            if isinstance(sig.get("market_context_json"), dict)
+            else None
+        )
+        or build_decision_levels(
+            {
+                "entry": sig.get("entry"),
+                "stop_loss": sig.get("stop_loss"),
+                "take_profit": sig.get("take_profit"),
+            },
+            sig.get("market_context_json") if isinstance(sig.get("market_context_json"), dict) else None,
+        ),
+    }
+
+
+def _fetch_klines_ending(
+    symbol: str,
+    timeframe: str,
+    *,
+    end_ms: int,
+    limit: int = 120,
+) -> list[dict[str, Any]]:
+    interval = normalize_timeframe(timeframe)
+    pair = symbol.upper().replace(".P", "").replace("/", "")
+    urls = [
+        f"https://api.binance.com/api/v3/klines?symbol={pair}&interval={interval}&endTime={end_ms}&limit={limit}",
+        f"https://fapi.binance.com/fapi/v1/klines?symbol={pair}&interval={interval}&endTime={end_ms}&limit={limit}",
+    ]
+    raw: list[Any] = []
+    with httpx.Client(timeout=12.0) as client:
+        for url in urls:
+            try:
+                r = client.get(url)
+                if r.status_code == 200 and isinstance(r.json(), list):
+                    raw = r.json()
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+    out: list[dict[str, Any]] = []
+    for row in raw:
+        try:
+            out.append(
+                {
+                    "t": int(row[0]),
+                    "o": float(row[1]),
+                    "h": float(row[2]),
+                    "l": float(row[3]),
+                    "c": float(row[4]),
+                    "v": float(row[5]),
+                }
+            )
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def _as_float(val: Any) -> float | None:
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return float(val)
+    return None
+
+
+def _resolve_strategy_id(
+    strategy_id: str | None, market: dict[str, Any]
+) -> str:
+    sid = strategy_id or market.get("strategy_id") or "desk"
+    if isinstance(sid, str):
+        return sid.strip().lower() or "desk"
+    return "desk"
+
+
+def _dedupe_recent(
+    *,
+    symbol: str,
+    timeframe: str,
+    sid: str,
+    bias: str,
+    entry: float | None,
+    status: str | None = None,
+) -> dict[str, Any] | None:
+    """Return an existing row if the same plan was archived in the last 30 minutes."""
+    with connect() as conn:
+        recent = conn.execute(
+            f"SELECT * FROM {_TABLE} ORDER BY seq DESC LIMIT 15"  # noqa: S608
+        ).fetchall()
+    recent = [from_db(_TABLE, r) for r in reversed(recent)]
+    now = datetime.now(timezone.utc)
+    for r in recent:
+        r_sid = r.get("strategy_id") or "desk"
+        if (
+            r.get("symbol") == symbol.upper()
+            and r.get("timeframe") == timeframe
+            and r_sid == sid
+            and r.get("bias") == bias
+            and (status is None or (r.get("status") or "") == status)
+            and (bias == "Neutral" or r.get("entry") == entry)
+        ):
+            created = _parse_ts(r.get("created_at"))
+            if created and (now - created).total_seconds() < 1800:
+                return r
+    return None
+
+
+def _insert_signal(sig: dict[str, Any]) -> dict[str, Any]:
+    with connect() as conn:
+        for _ in range(5):
+            try:
+                insert_row(conn, _TABLE, SIGNAL_COLUMNS, sig)
+                break
+            except sqlite3.IntegrityError:
+                sig["id"] = str(uuid.uuid4())[:8]
+        else:
+            raise RuntimeError("could not allocate a signal id")
+    return sig
+
+
 def record_signal(
     *,
     symbol: str,
@@ -119,85 +404,104 @@ def record_signal(
     multi_analysis: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """
-    Persist a Full-analysis call for later verification.
-    Skips Neutral / missing entry-SL-TP (nothing to verify).
+    Persist a Full-analysis call.
+    Buy/Sell with entry, stop and target become open trades to verify.
+    Neutral plans are archived with status neutral (WL-080) and stay out of trade KPIs.
     """
     bias = levels.get("bias") or "Neutral"
+    market = market or {}
+    coin = market.get("coin_analysis") if isinstance(market.get("coin_analysis"), dict) else {}
+    setup = market.get("setup") if isinstance(market.get("setup"), dict) else {}
+    conf = market.get("confluence") if isinstance(market.get("confluence"), dict) else {}
+    sid = _resolve_strategy_id(strategy_id, market)
+    price_now = (coin.get("price_data") or {}).get("current_price")
+
+    if bias == "Neutral":
+        dup = _dedupe_recent(
+            symbol=symbol,
+            timeframe=timeframe,
+            sid=sid,
+            bias="Neutral",
+            entry=None,
+            status="neutral",
+        )
+        if dup:
+            return dup
+        price = _as_float(price_now)
+        return _insert_signal(
+            {
+                "id": str(uuid.uuid4())[:8],
+                "created_at": _now(),
+                "symbol": symbol.upper(),
+                "timeframe": timeframe,
+                "bias": "Neutral",
+                "entry": None,
+                "stop_loss": None,
+                "take_profit": None,
+                "price_at_signal": price,
+                "setup": setup.get("type"),
+                "trade_allowed": setup.get("trade_allowed"),
+                "confluence": conf.get("score"),
+                "confidence": levels.get("confidence") or conf.get("confidence"),
+                "status": "neutral",
+                "outcome": None,
+                "verified_at": None,
+                "bars_checked": 0,
+                "hit_price": None,
+                "hit_at": None,
+                "r_multiple": None,
+                "notes": levels.get("reasoning") or "",
+                "strategy_id": sid,
+                "live_review_json": [],
+                "multi_analysis_json": multi_analysis,
+                "market_context_json": archive_market_context(levels, market),
+            }
+        )
+
     if bias not in ("Buy", "Sell"):
         return None
-    entry = levels.get("entry")
-    sl = levels.get("stop_loss")
-    tp = levels.get("take_profit")
+    entry = _as_float(levels.get("entry"))
+    sl = _as_float(levels.get("stop_loss"))
+    tp = _as_float(levels.get("take_profit"))
     if entry is None or sl is None or tp is None:
         return None
 
-    market = market or {}
-    coin = market.get("coin_analysis") if isinstance(market.get("coin_analysis"), dict) else {}
-    price = ((coin.get("price_data") or {}).get("current_price")) or entry
-    setup = market.get("setup") if isinstance(market.get("setup"), dict) else {}
-    conf = market.get("confluence") if isinstance(market.get("confluence"), dict) else {}
-    sid = (strategy_id or market.get("strategy_id") or "desk")
-    if isinstance(sid, str):
-        sid = sid.strip().lower() or "desk"
-    else:
-        sid = "desk"
+    price = _as_float(price_now) if price_now is not None else entry
+    dup = _dedupe_recent(
+        symbol=symbol, timeframe=timeframe, sid=sid, bias=bias, entry=entry
+    )
+    if dup:
+        return dup
 
-    with connect() as conn:
-        recent = conn.execute(
-            f"SELECT * FROM {_TABLE} ORDER BY seq DESC LIMIT 15"  # noqa: S608
-        ).fetchall()
-    recent = [from_db(_TABLE, r) for r in reversed(recent)]
-    # Deduplicate: same symbol/tf/strategy/bias/entry within 30 minutes
-    now = datetime.now(timezone.utc)
-    for r in recent:
-        r_sid = (r.get("strategy_id") or "desk")
-        if (
-            r.get("symbol") == symbol.upper()
-            and r.get("timeframe") == timeframe
-            and r_sid == sid
-            and r.get("bias") == bias
-            and r.get("entry") == entry
-        ):
-            created = _parse_ts(r.get("created_at"))
-            if created and (now - created).total_seconds() < 1800:
-                return r
-
-    sig = {
-        "id": str(uuid.uuid4())[:8],
-        "created_at": _now(),
-        "symbol": symbol.upper(),
-        "timeframe": timeframe,
-        "bias": bias,
-        "entry": float(entry),
-        "stop_loss": float(sl),
-        "take_profit": float(tp),
-        "price_at_signal": float(price) if price is not None else None,
-        "setup": setup.get("type"),
-        "trade_allowed": setup.get("trade_allowed"),
-        "confluence": conf.get("score"),
-        "confidence": levels.get("confidence") or conf.get("confidence"),
-        "status": "open",  # open | win | loss | expired | invalid
-        "outcome": None,
-        "verified_at": None,
-        "bars_checked": 0,
-        "hit_price": None,
-        "hit_at": None,
-        "r_multiple": None,
-        "notes": levels.get("reasoning") or "",
-        "strategy_id": sid,
-        "live_review_json": [],
-        "multi_analysis_json": multi_analysis,
-    }
-    with connect() as conn:
-        for _ in range(5):
-            try:
-                insert_row(conn, _TABLE, SIGNAL_COLUMNS, sig)
-                break
-            except sqlite3.IntegrityError:
-                sig["id"] = str(uuid.uuid4())[:8]  # 8-char id collision, try another
-        else:
-            raise RuntimeError("could not allocate a signal id")
-    return sig
+    return _insert_signal(
+        {
+            "id": str(uuid.uuid4())[:8],
+            "created_at": _now(),
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+            "bias": bias,
+            "entry": entry,
+            "stop_loss": sl,
+            "take_profit": tp,
+            "price_at_signal": price,
+            "setup": setup.get("type"),
+            "trade_allowed": setup.get("trade_allowed"),
+            "confluence": conf.get("score"),
+            "confidence": levels.get("confidence") or conf.get("confidence"),
+            "status": "open",  # open | win | loss | expired | invalid
+            "outcome": None,
+            "verified_at": None,
+            "bars_checked": 0,
+            "hit_price": None,
+            "hit_at": None,
+            "r_multiple": None,
+            "notes": levels.get("reasoning") or "",
+            "strategy_id": sid,
+            "live_review_json": [],
+            "multi_analysis_json": multi_analysis,
+            "market_context_json": archive_market_context(levels, market),
+        }
+    )
 
 
 def _interval_ms(interval: str) -> int:
@@ -271,19 +575,12 @@ def _fetch_klines_after(
 
 
 def _verify_timeframe(timeframe: str) -> tuple[str, int]:
-    """Finer tape for TP/SL order + how many of those bars to walk."""
+    """Walk the signal timeframe with documented horizons (WL-055).
+
+    Avoids aggressive 1m wick stop-outs that inflated losses vs the published policy.
+    """
     tf = normalize_timeframe(timeframe)
-    # (interval, max bars) — keep under Binance's 1500 cap
-    return {
-        "1w": ("4h", 84),
-        "1d": ("1m", 1500),   # ~1 day of 1m is enough for most; more if still open
-        "4h": ("1m", 1000),
-        "2h": ("1m", 800),
-        "1h": ("1m", 500),
-        "30m": ("1m", 400),
-        "15m": ("1m", 300),
-        "5m": ("1m", 200),
-    }.get(tf, (tf, DEFAULT_HORIZON_BARS.get(tf, 48)))
+    return tf, DEFAULT_HORIZON_BARS.get(tf, 48)
 
 
 def _same_bar_bias(bias: str, open_px: float, hi: float, lo: float, sl: float, tp: float) -> str:
@@ -367,6 +664,8 @@ def _resolve_outcome(
 
 def verify_signal(sig: dict[str, Any], force: bool = False) -> dict[str, Any]:
     """Update one signal's outcome from live candles."""
+    if (sig.get("status") or "").lower() == "neutral":
+        return sig
     if not force and sig.get("status") in ("win", "loss", "expired", "invalid"):
         return sig
 
@@ -462,6 +761,9 @@ def verify_all(
 
 def signal_stats(rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     rows = list(rows) if rows is not None else _load()
+    # Neutral archives stay out of trade KPIs (WL-080).
+    neutrals = [r for r in rows if (r.get("status") or "").lower() == "neutral"]
+    rows = [r for r in rows if (r.get("status") or "").lower() != "neutral"]
     closed = [r for r in rows if r.get("status") in ("win", "loss", "expired")]
     wins = [r for r in closed if r.get("status") == "win"]
     losses = [r for r in closed if r.get("status") == "loss"]
@@ -489,6 +791,7 @@ def signal_stats(rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         "wins": len(wins),
         "losses": len(losses),
         "expired": len(expired),
+        "neutral": len(neutrals),
         "hit_rate": round(hit, 3) if hit is not None else None,
         "avg_r": avg_r,
         "by_setup": by_setup,
@@ -622,6 +925,27 @@ def compute_live_stance(
     }
 
 
+def entry_fill_status(
+    *,
+    bias: str,
+    entry: float,
+    price: float | None,
+    price_at_signal: float | None = None,
+) -> str:
+    """filled | waiting | unknown. Limit-style plans wait until price reaches entry."""
+    if price is None:
+        return "unknown"
+    # Near-market at signal time => treat as market fill from open (~0.25% of price).
+    if price_at_signal is not None:
+        gap = abs(float(price_at_signal) - float(entry))
+        near = max(abs(float(entry)) * 0.0025, 1e-9)
+        if gap <= near:
+            return "filled"
+    if bias == "Buy":
+        return "filled" if float(price) <= float(entry) else "waiting"
+    return "filled" if float(price) >= float(entry) else "waiting"
+
+
 def suggest_revised_levels(
     *,
     symbol: str,
@@ -631,16 +955,27 @@ def suggest_revised_levels(
     entry: float,
     stop_loss: float,
     take_profit: float,
+    price: float | None = None,
+    price_at_signal: float | None = None,
 ) -> dict[str, Any]:
-    """Structural stop/target suggestion vs frozen plan. Does not mutate the signal."""
+    """Structural entry/stop/target advice vs frozen plan. Does not mutate the signal."""
     out: dict[str, Any] = {
         "revised_entry": None,
         "revised_stop_loss": None,
         "revised_take_profit": None,
         "levels_changed": False,
         "revise_reason": None,
+        "entry_status": entry_fill_status(
+            bias=bias, entry=entry, price=price, price_at_signal=price_at_signal
+        ),
+        "level_advice": {
+            "entry": {"action": "keep", "price": entry, "reason": "original entry"},
+            "stop": {"action": "keep", "price": stop_loss, "reason": "original stop"},
+            "target": {"action": "keep", "price": take_profit, "reason": "original target"},
+        },
     }
     risk = abs(entry - stop_loss) or 1e-9
+    entry_status = out["entry_status"]
     try:
         from .binance_ta import apply_strategy_risk_to_analysis, compute_local_analysis
         from .strategies import get_strategy
@@ -653,12 +988,18 @@ def suggest_revised_levels(
             stop_atr_min=r.stop_atr_min,
             stop_atr_max=r.stop_atr_max,
             target_r_min=r.target_r_min,
+            stop_buffer_atr=r.stop_buffer_atr,
+            entry_style=r.entry_style,
+            entry_offset_atr=r.entry_offset_atr,
         )
         analysis = apply_strategy_risk_to_analysis(
             analysis,
             stop_atr_min=r.stop_atr_min,
             stop_atr_max=r.stop_atr_max,
             target_r_min=r.target_r_min,
+            stop_buffer_atr=r.stop_buffer_atr,
+            entry_style=r.entry_style,
+            entry_offset_atr=r.entry_offset_atr,
         )
         sug = analysis.get("suggested_levels") if isinstance(analysis, dict) else None
         if not isinstance(sug, dict):
@@ -668,30 +1009,99 @@ def suggest_revised_levels(
         new_entry = sug.get("entry")
         if not isinstance(new_sl, (int, float)) or not isinstance(new_tp, (int, float)):
             return out
-        # Keep side consistent with original bias
-        if bias == "Buy" and not (new_sl < entry < new_tp):
-            return out
-        if bias == "Sell" and not (new_tp < entry < new_sl):
-            return out
-        d_sl = abs(float(new_sl) - stop_loss) / risk
-        d_tp = abs(float(new_tp) - take_profit) / risk
-        if d_sl < REVIEW_REVISE_MIN_R and d_tp < REVIEW_REVISE_MIN_R:
-            out["revise_reason"] = "structure near original levels"
-            return out
-        reasons = []
-        if d_sl >= REVIEW_REVISE_MIN_R:
-            reasons.append(f"stop moved {d_sl:.2f}R")
-        if d_tp >= REVIEW_REVISE_MIN_R:
-            reasons.append(f"target moved {d_tp:.2f}R")
-        out.update(
-            {
-                "revised_entry": float(new_entry) if isinstance(new_entry, (int, float)) else None,
-                "revised_stop_loss": float(new_sl),
-                "revised_take_profit": float(new_tp),
-                "levels_changed": True,
-                "revise_reason": "; ".join(reasons) or "structure changed",
+
+        advice_entry = out["level_advice"]["entry"]
+        advice_stop = out["level_advice"]["stop"]
+        advice_target = out["level_advice"]["target"]
+        reasons: list[str] = []
+
+        # Entry advice when not filled yet (limit/reclaim style).
+        if entry_status == "waiting" and isinstance(new_entry, (int, float)):
+            d_e = abs(float(new_entry) - entry) / risk
+            if bias == "Buy" and float(new_sl) < float(new_entry) < float(new_tp):
+                if d_e >= REVIEW_REVISE_MIN_R:
+                    advice_entry = {
+                        "action": "move",
+                        "price": float(new_entry),
+                        "reason": f"entry not filled; structure suggests {d_e:.2f}R adjust",
+                    }
+                    out["revised_entry"] = float(new_entry)
+                    reasons.append(advice_entry["reason"])
+                else:
+                    advice_entry = {
+                        "action": "wait",
+                        "price": entry,
+                        "reason": "entry not filled; keep working the limit",
+                    }
+                    reasons.append(advice_entry["reason"])
+            elif bias == "Sell" and float(new_tp) < float(new_entry) < float(new_sl):
+                if d_e >= REVIEW_REVISE_MIN_R:
+                    advice_entry = {
+                        "action": "move",
+                        "price": float(new_entry),
+                        "reason": f"entry not filled; structure suggests {d_e:.2f}R adjust",
+                    }
+                    out["revised_entry"] = float(new_entry)
+                    reasons.append(advice_entry["reason"])
+                else:
+                    advice_entry = {
+                        "action": "wait",
+                        "price": entry,
+                        "reason": "entry not filled; keep working the limit",
+                    }
+                    reasons.append(advice_entry["reason"])
+        elif entry_status == "filled":
+            advice_entry = {
+                "action": "keep",
+                "price": entry,
+                "reason": "entry filled or market-style; leave entry",
             }
+
+        # Stop / target: side-consistent vs original entry (plan freeze).
+        side_ok = (bias == "Buy" and new_sl < entry < new_tp) or (
+            bias == "Sell" and new_tp < entry < new_sl
         )
+        if side_ok:
+            d_sl = abs(float(new_sl) - stop_loss) / risk
+            d_tp = abs(float(new_tp) - take_profit) / risk
+            if d_sl >= REVIEW_REVISE_MIN_R:
+                # Prefer wider stops (more room) when structure says so.
+                wider = (bias == "Buy" and float(new_sl) < stop_loss) or (
+                    bias == "Sell" and float(new_sl) > stop_loss
+                )
+                advice_stop = {
+                    "action": "widen" if wider else "tighten",
+                    "price": float(new_sl),
+                    "reason": f"stop {d_sl:.2f}R from original ({'more room' if wider else 'tighter'})",
+                }
+                out["revised_stop_loss"] = float(new_sl)
+                reasons.append(advice_stop["reason"])
+            if d_tp >= REVIEW_REVISE_MIN_R:
+                advice_target = {
+                    "action": "move",
+                    "price": float(new_tp),
+                    "reason": f"target moved {d_tp:.2f}R vs structure",
+                }
+                out["revised_take_profit"] = float(new_tp)
+                reasons.append(advice_target["reason"])
+
+        changed = bool(
+            out["revised_entry"] is not None
+            or out["revised_stop_loss"] is not None
+            or out["revised_take_profit"] is not None
+            or advice_entry.get("action") == "wait"
+        )
+        out["level_advice"] = {
+            "entry": advice_entry,
+            "stop": advice_stop,
+            "target": advice_target,
+        }
+        out["levels_changed"] = changed and (
+            out["revised_entry"] is not None
+            or out["revised_stop_loss"] is not None
+            or out["revised_take_profit"] is not None
+        )
+        out["revise_reason"] = "; ".join(reasons) if reasons else "structure near original levels"
     except Exception as exc:  # noqa: BLE001
         logger.debug("revised levels skipped: %s", exc)
         out["revise_reason"] = f'na("revise failed: {exc}")'
@@ -745,7 +1155,43 @@ def live_review_signal(sig: dict[str, Any]) -> tuple[dict[str, Any], dict[str, A
         entry=orig_entry,
         stop_loss=orig_sl,
         take_profit=orig_tp,
+        price=price,
+        price_at_signal=sig.get("price_at_signal"),
     )
+
+    # Always compute fill status here so the field cannot be dropped by revise helpers.
+    fill = entry_fill_status(
+        bias=orig_bias,
+        entry=orig_entry,
+        price=price,
+        price_at_signal=sig.get("price_at_signal"),
+    )
+    advice = dict(revised.get("level_advice") or {}) if isinstance(revised.get("level_advice"), dict) else {}
+    if fill == "filled":
+        # Entry is locked once filled; only stop/target may change (WL-066).
+        advice["entry"] = {
+            "action": "locked",
+            "price": orig_entry,
+            "reason": "entry filled; leave entry, manage stop and target",
+        }
+        advice.pop("revised_entry", None)
+    elif not advice.get("entry"):
+        advice["entry"] = {
+            "action": "wait" if fill == "waiting" else "keep",
+            "price": orig_entry,
+            "reason": (
+                "entry not filled yet"
+                if fill == "waiting"
+                else "entry filled or market-style"
+            ),
+        }
+    if not advice.get("stop"):
+        advice["stop"] = {"action": "keep", "price": orig_sl, "reason": "original stop"}
+    if not advice.get("target"):
+        advice["target"] = {"action": "keep", "price": orig_tp, "reason": "original target"}
+    if fill == "filled":
+        # Do not suggest a new entry after fill.
+        revised = {**revised, "revised_entry": None}
 
     if price is None:
         review = {
@@ -757,12 +1203,17 @@ def live_review_signal(sig: dict[str, Any]) -> tuple[dict[str, Any], dict[str, A
             "stance": None,
             "summary": 'na("no live price")',
             "verify_status": sig.get("status"),
+            "ai_reasoning": None,
             **revised,
+            "entry_status": "unknown",
+            "level_advice": advice,
         }
     else:
+        # Stance R uses entry once filled; while waiting, mark to entry distance softly.
+        stance_entry = orig_entry
         metrics = compute_live_stance(
             bias=orig_bias,
-            entry=orig_entry,
+            entry=stance_entry,
             stop_loss=orig_sl,
             take_profit=orig_tp,
             price=price,
@@ -770,8 +1221,10 @@ def live_review_signal(sig: dict[str, Any]) -> tuple[dict[str, Any], dict[str, A
             strategy_id=sig.get("strategy_id") or "desk",
         )
         summary = metrics["summary"]
-        if revised.get("levels_changed"):
-            summary = f"{summary}; revised levels: {revised.get('revise_reason')}"
+        if fill == "waiting":
+            summary = f"entry waiting; {summary}"
+        if revised.get("revise_reason"):
+            summary = f"{summary}; {revised.get('revise_reason')}"
         review = {
             "at": _now(),
             "price": price,
@@ -781,7 +1234,11 @@ def live_review_signal(sig: dict[str, Any]) -> tuple[dict[str, Any], dict[str, A
             "stance": metrics["stance"],
             "summary": summary,
             "verify_status": sig.get("status"),
+            "ai_reasoning": None,
             **revised,
+            # Stamp after **revised so these keys always win.
+            "entry_status": fill,
+            "level_advice": advice,
         }
 
     history.append(review)
@@ -789,7 +1246,62 @@ def live_review_signal(sig: dict[str, Any]) -> tuple[dict[str, Any], dict[str, A
     return sig, review, None
 
 
-def live_review_one(signal_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+async def attach_live_review_ai(
+    sig: dict[str, Any], review: dict[str, Any]
+) -> dict[str, Any]:
+    """AI stance + reasoning beside rule stance; never overwrites rule stance (WL-067)."""
+    from .ai import build_live_review_prompt, generate_text, parse_live_review_ai
+    from .config import get_settings, resolve_provider
+
+    settings = get_settings()
+    provider = resolve_provider(settings)
+    base = {
+        **review,
+        "ai_stance": None,
+        "ai_stance_reason": None,
+        "ai_reasoning": None,
+    }
+    if provider == "none":
+        return {
+            **base,
+            "ai_provider": "none",
+            "ai_status": "skipped",
+            "ai_error": "AI_PROVIDER=none; live review AI not called",
+        }
+    prompt = build_live_review_prompt(sig, review)
+    try:
+        text, used = await generate_text(prompt, settings)
+        text = (text or "").strip()
+        if used == "offline" or not text:
+            return {
+                **base,
+                "ai_provider": used,
+                "ai_status": "skipped",
+                "ai_error": "provider returned offline or empty text",
+            }
+        parsed = parse_live_review_ai(text)
+        return {
+            **base,
+            "ai_stance": parsed.get("ai_stance"),
+            "ai_stance_reason": parsed.get("ai_stance_reason"),
+            "ai_reasoning": parsed.get("ai_reasoning"),
+            "ai_provider": used,
+            "ai_status": "ok",
+            "ai_error": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("live review AI failed via %s: %s", provider, exc)
+        return {
+            **base,
+            "ai_provider": provider,
+            "ai_status": "error",
+            "ai_error": str(exc)[:400],
+        }
+
+
+async def live_review_one(
+    signal_id: str, *, with_ai: bool = True
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
     with connect() as conn:
         sig = from_db(
             _TABLE,
@@ -800,11 +1312,17 @@ def live_review_one(signal_id: str) -> tuple[dict[str, Any] | None, dict[str, An
     sig, review, err = live_review_signal(sig)
     if err in ("signal is not open", "incomplete levels"):
         return sig, None, err
+    if review is not None and with_ai:
+        review = await attach_live_review_ai(sig, review)
+        hist = list(_reviews_list(sig))
+        if hist:
+            hist[-1] = review
+            sig["live_review_json"] = hist
     _save([sig])
     return sig, review, err
 
 
-def live_review_all(*, only_open: bool = True, limit: int = 50) -> dict[str, Any]:
+async def live_review_all(*, only_open: bool = True, limit: int = 50) -> dict[str, Any]:
     rows = _load()
     checked = 0
     updated = 0
@@ -817,7 +1335,13 @@ def live_review_all(*, only_open: bool = True, limit: int = 50) -> dict[str, Any
             break
         before_len = len(_reviews_list(sig))
         before_status = sig.get("status")
-        rows[i], _review, err = live_review_signal(sig)
+        rows[i], review, err = live_review_signal(sig)
+        if review is not None and err not in ("incomplete levels",):
+            review = await attach_live_review_ai(rows[i], review)
+            hist = list(_reviews_list(rows[i]))
+            if hist:
+                hist[-1] = review
+                rows[i]["live_review_json"] = hist
         checked += 1
         if err in ("incomplete levels",):
             continue

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,12 +30,15 @@ from .market import (
 )
 from .schemas import (
     AnalyzeRequest,
+    BacktestRunRequest,
     CalendarResponse,
     AnalyzeResponse,
     ChatRequest,
     ChatResponse,
     CorrelationResponse,
     HealthResponse,
+    HotAskRequest,
+    HotScanRequest,
     JobsResponse,
     JournalClose,
     JournalCreate,
@@ -44,6 +48,49 @@ from .schemas import (
     WatchlistRequest,
 )
 from .strategies import get_strategy
+from .traps import apply_pack_quality_guard, apply_trap_guard, classify_traps
+
+
+def normalize_guard_mode(raw: str | None) -> str:
+    """WL-063: enforce (default) or ai_only (keep model plan, no bias override)."""
+    v = (raw or "enforce").strip().lower().replace("-", "_")
+    if v in ("ai_only", "aioff", "off", "none", "raw"):
+        return "ai_only"
+    return "enforce"
+
+
+def _apply_post_ai_guards(
+    levels: TradeLevels,
+    market: dict,
+    *,
+    strategy,
+    guard_mode: str,
+) -> TradeLevels:
+    """Decision 0003 path when enforce; identity when ai_only."""
+    if guard_mode == "ai_only":
+        return levels
+    if strategy.uses_desk_pipeline:
+        levels = _apply_confluence_guardrail(levels, market)
+    else:
+        levels = apply_pack_quality_guard(levels, market)
+    levels = apply_trap_guard(levels, market)
+    return _apply_reward_risk_guard(levels, min_rr=strategy.risk.min_reward_risk)
+
+
+def _attach_traps(market: dict) -> dict:
+    """Promote dual books and ensure market.traps for guards and the UI."""
+    if not isinstance(market, dict):
+        return market
+    book = market.get("orderbook") if isinstance(market.get("orderbook"), dict) else {}
+    updates: dict = {}
+    if "orderbook_spot" not in market and isinstance(book.get("orderbook_spot"), dict):
+        updates["orderbook_spot"] = book["orderbook_spot"]
+    if "orderbook_futures" not in market and isinstance(book.get("orderbook_futures"), dict):
+        updates["orderbook_futures"] = book["orderbook_futures"]
+    m = {**market, **updates} if updates else market
+    if isinstance(m.get("traps"), dict) and m["traps"].get("summary") is not None:
+        return m
+    return {**m, "traps": classify_traps(m)}
 
 
 def _apply_confluence_guardrail(levels: TradeLevels, market: dict) -> TradeLevels:
@@ -58,8 +105,8 @@ def _apply_confluence_guardrail(levels: TradeLevels, market: dict) -> TradeLevel
     # Chop / no-trade setup → force Neutral
     if isinstance(setup, dict) and setup.get("trade_allowed") is False:
         bias = "Neutral"
-    # Soft zone → force Neutral
-    elif abs(score) < 2.5:
+    # Soft zone → force Neutral (WL-055: band raised from 2.5 to 3.0)
+    elif abs(score) < 3.0:
         bias = "Neutral"
     # Never allow opposite of strong confluence
     elif preferred == "Buy" and bias == "Sell":
@@ -90,17 +137,20 @@ def _apply_confluence_guardrail(levels: TradeLevels, market: dict) -> TradeLevel
     )
 
 
-MIN_REWARD_RISK = 1.0
+MIN_REWARD_RISK = 1.5  # desk default; per-strategy override via min_rr (WL-055)
 
 
-def _apply_reward_risk_guard(levels: TradeLevels) -> TradeLevels:
-    """A directional plan must have levels on the right sides and pay at least 1:1."""
+def _apply_reward_risk_guard(
+    levels: TradeLevels, *, min_rr: float | None = None
+) -> TradeLevels:
+    """Directional plan must have correct sides and pay at least min_rr (default 1.5)."""
     if levels.bias not in ("Buy", "Sell"):
         return levels
     entry, stop, target = levels.entry, levels.stop_loss, levels.take_profit
     if entry is None or stop is None or target is None:
         return levels
 
+    floor = float(MIN_REWARD_RISK if min_rr is None else min_rr)
     if levels.bias == "Buy":
         wrong_side = not (stop < entry < target)
     else:
@@ -109,11 +159,80 @@ def _apply_reward_risk_guard(levels: TradeLevels) -> TradeLevels:
     reward_risk = abs(target - entry) / risk if risk else 0.0
 
     if wrong_side:
-        note = "Levels on the wrong side of entry → Neutral"
-    elif reward_risk < MIN_REWARD_RISK:
-        note = f"R:R {reward_risk:.2f} below {MIN_REWARD_RISK:.0f}:1 → Neutral"
+        note = "Levels on the wrong side of entry -> Neutral"
+    elif reward_risk < floor:
+        note = f"R:R {reward_risk:.2f} below {floor:g}:1 -> Neutral"
     else:
         return levels
+    reason = f"{levels.reasoning} | {note}".strip(" |")
+    return levels.model_copy(update={"bias": "Neutral", "reasoning": reason})
+
+
+def _live_price_from_market(market: dict | None) -> float | None:
+    if not isinstance(market, dict):
+        return None
+    live = market.get("live_price") if isinstance(market.get("live_price"), dict) else {}
+    for key in ("price", "mark"):
+        val = live.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+            return float(val)
+    coin = market.get("coin_analysis") if isinstance(market.get("coin_analysis"), dict) else {}
+    px = (coin.get("price_data") or {}).get("current_price")
+    if isinstance(px, (int, float)) and not isinstance(px, bool) and px > 0:
+        return float(px)
+    yahoo = market.get("yahoo_price") if isinstance(market.get("yahoo_price"), dict) else {}
+    ypx = yahoo.get("price")
+    if isinstance(ypx, (int, float)) and not isinstance(ypx, bool) and ypx > 0:
+        return float(ypx)
+    return None
+
+
+def stamp_live_price(market: dict, pair: str) -> dict:
+    """Refresh last trade into the snapshot so long ensemble runs are not stuck on a stale print."""
+    from .binance_ta import fetch_live_last_price
+
+    if not isinstance(market, dict):
+        return market
+    px = fetch_live_last_price(pair)
+    if px is None:
+        return {**market, "live_price": {"available": False}}
+    out = {
+        **market,
+        "live_price": {"available": True, "price": px, "source": "binance_ticker"},
+        "yahoo_price": {"price": px, "source": "binance_ticker"},
+    }
+    coin = out.get("coin_analysis") if isinstance(out.get("coin_analysis"), dict) else None
+    if coin is not None:
+        price_data = dict(coin.get("price_data") or {})
+        price_data["current_price"] = px
+        price_data["live_refreshed"] = True
+        out["coin_analysis"] = {**coin, "price_data": price_data}
+    return out
+
+
+def _apply_stop_breached_guard(levels: TradeLevels, market: dict | None) -> TradeLevels:
+    """Neutral when live mark is already through the stop (WL-081).
+
+    Runs even in ai_only: this is market reality vs printed levels, not confluence taste.
+    Long AI ensembles can finish with levels from an earlier print while the chart has moved.
+    """
+    if levels.bias not in ("Buy", "Sell"):
+        return levels
+    stop = levels.stop_loss
+    if stop is None:
+        return levels
+    price = _live_price_from_market(market)
+    if price is None:
+        return levels
+    breached = (levels.bias == "Buy" and price <= float(stop)) or (
+        levels.bias == "Sell" and price >= float(stop)
+    )
+    if not breached:
+        return levels
+    note = (
+        f"Live price {price:g} already through stop {float(stop):g} -> Neutral "
+        "(plan invalidated before entry)"
+    )
     reason = f"{levels.reasoning} | {note}".strip(" |")
     return levels.model_copy(update={"bias": "Neutral", "reasoning": reason})
 
@@ -230,6 +349,8 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     if not pair:
         raise HTTPException(400, "Invalid symbol")
 
+    guard_mode = normalize_guard_mode(req.guard_mode)
+
     # WL-054: all strategies + optimization
     if (req.strategy_id or "").strip().lower() == "all":
         from .multi_analyze import normalize_optimize_mode, run_multi_analyze
@@ -246,6 +367,7 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
                 fill_levels=_fill_levels_from_market,
                 apply_confluence=_apply_confluence_guardrail,
                 apply_rr=_apply_reward_risk_guard,
+                guard_mode=guard_mode,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("multi analyze failed")
@@ -253,7 +375,7 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
             raise HTTPException(status_code=502, detail=f"AI error: {detail}") from exc
 
         levels: TradeLevels = multi["levels"]
-        market = multi["market"] or {}
+        market = _attach_traps(multi["market"] or {})
         analysis = multi["analysis"]
         provider = multi["provider"]
         effective_tf = str(multi.get("timeframe") or req.timeframe)
@@ -261,24 +383,47 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         strategy_label = multi["strategy_label"]
         packs = multi.get("packs")
         multi_blob = multi.get("multi_analysis")
+        winner = get_strategy(final_sid)
+        # Packs already respected guard_mode; final pass only when enforce.
+        if guard_mode == "enforce":
+            levels = apply_pack_quality_guard(levels, market)
+            levels = apply_trap_guard(levels, market)
+            levels = _apply_reward_risk_guard(
+                levels, min_rr=winner.risk.min_reward_risk
+            )
+        # Always refresh mark and kill plans already through the stop (WL-081).
+        pre_live = levels.bias
+        market = stamp_live_price(market, pair)
+        levels = _apply_stop_breached_guard(levels, market)
+        if pre_live != levels.bias and levels.bias == "Neutral":
+            analysis = (
+                f"LIVE INVALIDATION: {pre_live} plan dropped; mark already through the stop.\n\n"
+                + analysis
+            )
+        market = {**market, "guard_mode": guard_mode}
 
         logger.info(
-            "analyze %s %s strategy=all mode=%s -> %s (%s)",
+            "analyze %s %s strategy=all mode=%s guard=%s -> %s (%s)",
             pair,
             effective_tf,
             mode,
+            guard_mode,
             levels.bias,
             final_sid,
         )
 
-        # Archive directional multi plans (including local_score packs) so the
-        # detail page keeps every pack's initial result in multi_analysis_json.
-        archive_ok = (
-            levels.bias in ("Buy", "Sell")
-            and levels.entry is not None
-            and levels.stop_loss is not None
-            and levels.take_profit is not None
-        )
+        # Archive Buy/Sell trades and Neutral holds (WL-055 / WL-080). Offline never archives.
+        archive_ok = False
+        if provider != "offline":
+            if levels.bias == "Neutral":
+                archive_ok = True
+            elif (
+                levels.bias in ("Buy", "Sell")
+                and levels.entry is not None
+                and levels.stop_loss is not None
+                and levels.take_profit is not None
+            ):
+                archive_ok = True
         if archive_ok:
             try:
                 from .signals import record_signal
@@ -307,6 +452,7 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
             levels=levels,
             analysis=analysis,
             provider=provider,
+            guard_mode=guard_mode,
             optimize_mode=mode,
             final_strategy_id=final_sid,
             packs=packs,
@@ -332,6 +478,10 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         stop_atr_min=risk.stop_atr_min,
         stop_atr_max=risk.stop_atr_max,
         min_reward_risk=risk.min_reward_risk,
+        guard_mode=guard_mode,
+        stop_buffer_atr=risk.stop_buffer_atr,
+        entry_style=risk.entry_style,
+        entry_offset_atr=risk.entry_offset_atr,
     )
     try:
         text, provider = await generate_text(prompt, settings)
@@ -341,17 +491,25 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         raise HTTPException(status_code=502, detail=f"AI error: {detail}") from exc
     levels = extract_levels(text)
     model_bias = levels.bias
+    market = _attach_traps(market)
     levels = _fill_levels_from_market(levels, market)
-    # Snapshot for the signal archive before desk guards can force Neutral.
-    levels_for_signal = levels.model_dump()
-    # Desk pipeline only: confluence / chop guards decide the bias (decision 0003).
-    if strategy.uses_desk_pipeline:
-        levels = _apply_confluence_guardrail(levels, market)
-    levels = _apply_reward_risk_guard(levels)
+    # Desk pipeline: confluence / chop / traps / R:R when enforce (decision 0003 + WL-063).
+    levels = _apply_post_ai_guards(
+        levels, market, strategy=strategy, guard_mode=guard_mode
+    )
+    # Fresh ticker after the AI wait; stop already breached always Neutral (WL-081).
+    market = stamp_live_price(market, pair)
+    levels = _apply_stop_breached_guard(levels, market)
+    market = {**market, "guard_mode": guard_mode}
     analysis = format_clear_brief(
         pair, req.exchange.upper(), effective_tf, levels, text
     )
-    if provider != "offline" and levels.bias != model_bias and strategy.uses_desk_pipeline:
+    if (
+        guard_mode == "enforce"
+        and provider != "offline"
+        and levels.bias != model_bias
+        and strategy.uses_desk_pipeline
+    ):
         # The card below is the model's own; say why the plan's bias differs from it.
         conf = market.get("confluence") if isinstance(market.get("confluence"), dict) else {}
         analysis = (
@@ -359,34 +517,31 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
             f"(confluence {float(conf.get('score') or 0):+.1f}/10 and the R:R guard decide the bias).\n\n"
             + analysis
         )
+    elif provider != "offline" and levels.bias != model_bias and levels.bias == "Neutral":
+        analysis = (
+            f"LIVE INVALIDATION: the analyst said {model_bias}; the plan is Neutral "
+            "(live mark already through the stop).\n\n"
+            + analysis
+        )
     logger.info(
-        "analyze %s %s strategy=%s via %s -> %s",
+        "analyze %s %s strategy=%s via %s guard=%s -> %s",
         pair,
         effective_tf,
         strategy.id,
         provider,
+        guard_mode,
         levels.bias,
     )
 
-    # Archive Buy/Sell plans for later TP/SL verification. Offline plans are
-    # never archived — the track record is for calls an AI actually made.
-    # Use the pre-guard bias so a desk Neutral override still leaves a trackable plan
-    # when the model (or filled levels) had a real entry / stop / target.
-    if provider != "offline":
+    # Archive Buy/Sell trades and Neutral holds (WL-055 / WL-080). Offline never archives.
+    if provider != "offline" and levels.bias in ("Buy", "Sell", "Neutral"):
         try:
             from .signals import record_signal
 
-            archive = dict(levels_for_signal)
-            if archive.get("bias") not in ("Buy", "Sell") and model_bias in ("Buy", "Sell"):
-                archive["bias"] = model_bias
-            if levels.bias == "Neutral" and archive.get("bias") in ("Buy", "Sell"):
-                note = (archive.get("reasoning") or "").strip()
-                override = f"Desk plan Neutral (guards); archived as {archive['bias']}"
-                archive["reasoning"] = f"{note} | {override}".strip(" |")
             sig = record_signal(
                 symbol=pair,
                 timeframe=effective_tf,
-                levels=archive,
+                levels=levels.model_dump(),
                 market=market,
                 strategy_id=strategy.id,
             )
@@ -406,6 +561,7 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         levels=levels,
         analysis=analysis,
         provider=provider,
+        guard_mode=guard_mode,
     )
 
 
@@ -497,6 +653,31 @@ async def watchlist_score_get(timeframe: str = "1h", symbols: str = ""):
     return score_watchlist(syms or DEFAULT_WATCHLIST, timeframe)
 
 
+@app.post("/api/hot/scan")
+async def hot_scan(req: HotScanRequest):
+    """Rank liquid USDT pairs by local volatility hot score (WL-069)."""
+    from .hot import run_hot_scan
+
+    tf = (req.timeframe or "1h").strip().lower()
+    if tf not in ("15m", "1h", "4h"):
+        tf = "1h"
+    return await run_hot_scan(
+        category=req.category,
+        top_n=req.top_n,
+        timeframe=tf,
+        symbols=req.symbols,
+        with_ai_brief=req.with_ai_brief,
+    )
+
+
+@app.post("/api/hot/ask")
+async def hot_ask_endpoint(req: HotAskRequest):
+    """Freeform Ask AI over the latest Hot scan table (no full Desk snapshot)."""
+    from .hot import hot_ask
+
+    return await hot_ask(req.message, req.scan_context)
+
+
 @app.get("/api/journal/stats")
 async def journal_stats():
     from .journal import stats
@@ -505,15 +686,35 @@ async def journal_stats():
 
 
 @app.get("/api/signals")
-async def signals_list(limit: int = 80, symbol: str = "", strategy_id: str = ""):
+async def signals_list(
+    limit: int = 80,
+    symbol: str = "",
+    strategy_id: str = "",
+    kind: str = "trades",
+):
+    """kind=trades (default) excludes Neutral archives; kind=neutral is only those; kind=all is both."""
     from .signals import list_signals, signal_stats
 
     sid = strategy_id.strip() or None
-    rows = list_signals(limit, symbol or None, sid)
-    return {
-        "signals": rows,
-        "stats": signal_stats(rows) if sid or symbol else signal_stats(),
-    }
+    k = (kind or "trades").strip().lower() or "trades"
+    rows = list_signals(limit, symbol or None, sid, kind=k)
+    if k == "neutral":
+        stats = {
+            "total": len(rows),
+            "open": 0,
+            "wins": 0,
+            "losses": 0,
+            "expired": 0,
+            "neutral": len(rows),
+            "hit_rate": None,
+            "avg_r": None,
+            "by_setup": {},
+        }
+    elif sid or symbol:
+        stats = signal_stats(rows)
+    else:
+        stats = signal_stats()
+    return {"signals": rows, "stats": stats, "kind": k}
 
 
 @app.get("/api/signals/dashboard")
@@ -529,12 +730,37 @@ async def signal_get(signal_id: str):
     """Full signal including multi_analysis_json and live_review_json (WL-054)."""
     from .signals import get_signal
 
-    if signal_id in ("dashboard", "verify", "review"):
+    if signal_id in ("dashboard", "verify", "review", "tape"):
         raise HTTPException(404, "signal not found")
     sig = get_signal(signal_id)
     if not sig:
         raise HTTPException(404, "signal not found")
     return {"signal": sig}
+
+
+@app.get("/api/signals/{signal_id}/tape")
+async def signal_tape_endpoint(signal_id: str, bars: int = 120, live: bool = False):
+    """OHLC for the decision chart (WL-077). live=1 ends at now for polling (WL-078)."""
+    from .signals import signal_tape
+
+    if signal_id in ("dashboard", "verify", "review"):
+        raise HTTPException(404, "signal not found")
+    tape = signal_tape(signal_id, bars=bars, live=bool(live))
+    if not tape:
+        raise HTTPException(404, "signal not found")
+    return tape
+
+
+@app.delete("/api/signals/{signal_id}")
+async def signal_delete(signal_id: str):
+    """Remove one signal and its embedded review / multi-analysis JSON (WL-071)."""
+    from .signals import delete_signal, signal_stats
+
+    if signal_id in ("dashboard", "verify", "review"):
+        raise HTTPException(404, "signal not found")
+    if not delete_signal(signal_id):
+        raise HTTPException(404, "signal not found")
+    return {"ok": True, "stats": signal_stats()}
 
 
 @app.post("/api/signals/verify")
@@ -554,14 +780,14 @@ async def signals_review_all(only_open: bool = True, limit: int = 50):
     """Live review open signals: append stance history; originals stay frozen (WL-052)."""
     from .signals import live_review_all
 
-    return live_review_all(only_open=only_open, limit=limit)
+    return await live_review_all(only_open=only_open, limit=limit)
 
 
 @app.post("/api/signals/{signal_id}/review")
 async def signal_review_one(signal_id: str):
     from .signals import live_review_one, signal_stats
 
-    sig, review, err = live_review_one(signal_id)
+    sig, review, err = await live_review_one(signal_id)
     if sig is None:
         raise HTTPException(404, "signal not found")
     if err in ("signal is not open", "incomplete levels"):
@@ -595,6 +821,69 @@ def jobs_status() -> JobsResponse:
     from .jobs import job_status
 
     return JobsResponse(jobs=job_status())
+
+
+@app.post("/api/backtests/run")
+async def backtests_run(req: BacktestRunRequest):
+    """Walk-forward backtest: pick coins/strategies, hide future bars (WL-057)."""
+    from .backtests import run_backtest
+
+    try:
+        return await asyncio.to_thread(
+            run_backtest,
+            mode=req.mode,
+            strategy_id=req.strategy_id,
+            strategy_ids=req.strategy_ids or None,
+            symbols=req.symbols or None,
+            bars=req.bars,
+            step=req.step,
+            timeframe=req.timeframe,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("backtest failed")
+        raise HTTPException(502, f"backtest error: {exc}") from exc
+
+
+@app.get("/api/backtests/runs")
+async def backtests_runs(limit: int = 20):
+    from .backtests import list_runs
+
+    return {"runs": list_runs(limit)}
+
+
+@app.get("/api/backtests/runs/{run_id}")
+async def backtests_run_get(
+    run_id: str,
+    trades: bool = False,
+    strategy_id: str = "",
+    symbol: str = "",
+    outcome: str = "",
+    limit: int = 500,
+):
+    from .backtests import get_run, list_trades
+
+    run = get_run(run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    out: dict = {"run": run}
+    if trades:
+        out["trades"] = list_trades(
+            run_id,
+            strategy_id=strategy_id.strip() or None,
+            symbol=symbol.strip() or None,
+            outcome=outcome.strip() or None,
+            limit=min(max(limit, 1), 2000),
+        )
+    return out
+
+
+@app.get("/api/backtests/rankings")
+async def backtests_rankings(prefer_mode: str = "deep"):
+    from .backtests import rankings
+
+    return rankings(prefer_mode=prefer_mode or "deep")
 
 
 @app.get("/api/journal")

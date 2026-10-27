@@ -6,6 +6,33 @@ Items WL-001 to WL-014 were logged retroactively on 2026-10-21, when the ruleset
 
 | Id | Title | Status |
 |---|---|---|
+| WL-081 | Invalidate plans when live price already through stop | done |
+| WL-080 | Archive Neutral analyses on a Signals Neutral tab | done |
+| WL-079 | Crowded fade, range fade, session box, FVG, day fade | done |
+| WL-078 | Signal detail chart: live candles + price decimals | done |
+| WL-077 | Signal detail archived context + auto decision chart | done |
+| WL-076 | AB=CD harmonic strategy pack | done |
+| WL-075 | Always fetch flow/liquidity for named strategy packs | done |
+| WL-074 | Tighten strategy prompt_rules + scalping buffer | done |
+| WL-073 | Signals coin multi-select filter | done |
+| WL-072 | Signals open-book overview cards | done |
+| WL-071 | Delete signal from UI (and related JSON) | done |
+| WL-070 | Signals live mark: row tint + unrealized R | done |
+| WL-069 | Hot tab: volatility coin finder | done |
+| WL-068 | Simple Core strategy pack | done |
+| WL-067 | Hybrid live review: rule stance + AI stance | done |
+| WL-066 | Live review cards UX + AI status + flow docs | done |
+| WL-065 | Live review entry status unknown / missing advice | done |
+| WL-064 | Strategy stop room, entry styles, richer live review | done |
+| WL-063 | Desk guard mode: enforce or AI only | done |
+| WL-062 | Backtest coin picker uses symbol search | done |
+| WL-061 | Tighten backtest entries after loss analysis | done |
+| WL-060 | Backtest run detail page | done |
+| WL-059 | Backtest timeframe option and saved run browser | done |
+| WL-058 | Backtest trade ledger and signal reasons | done |
+| WL-057 | Walk-forward backtests (pick coins, hide future bars) | done |
+| WL-055 | Harden win rate and R:R (archive, traps, verify) | done |
+| WL-056 | Backtests module (shallow/deep, ranking, charts) | done |
 | WL-054 | Multi-strategy analysis + signal detail page | done |
 | WL-053 | Strategy-owned stop distance and live-review bands | done |
 | WL-052 | Open signal live review (keep original + stance history) | done |
@@ -62,6 +89,197 @@ Items WL-001 to WL-014 were logged retroactively on 2026-10-21, when the ruleset
 | WL-001 | Claude API provider next to Cursor and OpenAI | done |
 
 ## Items
+
+### WL-081: Invalidate plans when live price already through stop
+
+- **Context:** QUSDT Buy showed entry ~0.20 / SL ~0.163 while live mark was ~0.14 (already through stop). Full AI ensemble freezes the snapshot at start; Guards AI only skipped R:R. Live Binance data is fine; the plan was stale and unguarded.
+- **Acceptance:** End of analyze refreshes live mark; Buy with price at or below stop (or Sell at or above stop) becomes Neutral even in ai_only; note in reasoning; tests; signals or analysis-flow note.
+- **Status:** done.
+- **Outcome:** Confirmed Binance live QUSDT ~0.136 was real; stale Buy entry ~0.20 came from a pre-crash snapshot under Guards AI only. Added live ticker refresh + stop-breached Neutral (always, including ai_only). Tests green. Backup: backup-wl081.
+
+### WL-080: Archive Neutral analyses on a Signals Neutral tab
+
+- **Context:** Full analyses that finish Neutral are skipped today. Store them separately from tradeable signals and show them on a Signals page tab that never mixes with Buy/Sell.
+- **Acceptance:** Neutral rows archived with status neutral; default signal list and KPIs exclude them; GET kind=neutral; Signals Trades / Neutral tabs; verify and live review skip neutrals; tests and signals docs.
+- **Status:** done.
+- **Outcome:** Neutral analyses archive with status neutral; default list and KPIs exclude them; GET kind=neutral; Signals Trades/Neutral tabs; verify and dashboard skip neutrals. Tests and signals.md updated. Backup: backup-wl080.
+
+### WL-079: Crowded fade, range fade, session box, FVG, day fade
+
+- **Context:** Add five named packs: fade crowded funding and whale positioning, fade a quiet range, trade the completed Asia session box, fill a fair value gap with higher-timeframe structure, and an intraday day fade that trades against obvious technical levels (prior day high/low, VWAP, EMA cluster) when they reject.
+- **Acceptance:** Five ids in the catalog with prompt_rules and risk; session box, day levels, and unfilled-gap blocks on local TA; fit hints; backtest heuristics; tests; strategies.md.
+- **Status:** done.
+- **Outcome:** Five packs in the catalog. Local TA adds session_box, day_levels, and fair_value_gaps. Fit hints and backtest heuristics match each playbook. Day Fade trades against obvious technical levels on rejection. 230 tests passed, ruff clean. No incidents. Files: strategies.py, binance_ta.py, market.py, backtest_engine.py, test_strategies.py, strategies.md. Backup: backup-wl079.
+
+### WL-078: Signal detail chart: live candles + price decimals
+
+- **Context:** Decision chart price scale shows only 2 decimals; hover needs finer precision; user wants live candles with archived drawings kept on the chart.
+- **Acceptance:** Right scale ≥3 decimals; crosshair hover shows 5; tape polls live OHLC ending now; decision_levels stay drawn across updates; docs + gate.
+- **Status:** done.
+- **Outcome:** tape `live=true`; Detail polls every 5s; chart axis 3dp / hover tip 5dp; price lines not rebuilt on candle refresh.
+
+### WL-077: Signal detail archived context + auto decision chart
+
+- **Context:** Signal Detail should show whales/liquidity/structure used at analyze time and auto-draw entry/stop/TP/S/R/Fib/trend lines on a decision chart.
+- **Acceptance:** market_context_json with decision_levels on archive; tape endpoint; Detail cards + SignalLevelsChart auto-draw; docs; gate green.
+- **Status:** done.
+- **Outcome:** Migration 010; archive slim context + decision_levels; GET tape; Signal Detail cards and auto-drawn lightweight-charts levels; Fib only when snapshot has Fib (retracement/abcd).
+
+### WL-076: AB=CD harmonic strategy pack
+
+- **Context:** Add AB=CD (harmonic) as a named Desk strategy with strict symmetry / Fib rules and explain why it is a strong measured-move playbook.
+- **Acceptance:** `abcd` in catalog; prompt_rules for A-B-C-D, BC retrace, CD = AB; limit into D; Neutral if pattern incomplete; tests; strategies.md.
+- **Status:** done.
+- **Outcome:** `abcd` pack (1h+4h, swings/Fib); strict AB=CD prompt_rules; tests and strategies.md updated.
+
+### WL-075: Always fetch flow/liquidity for named strategy packs
+
+- **Context:** Desk cards for whales and liquidity stayed empty on ZEC (and other futures pairs) when analyzing with packs that have needs_liquidity=false (e.g. Simple Core, Breakout). Data exists on Binance Futures; the pack path skipped the fetch.
+- **Acceptance:** Named strategy analyze always attaches flow, orderbook and liquidity when available; Desk cards fill for ZECUSDT; desk pipeline unchanged; note in analysis-flow or strategies docs.
+- **Status:** done.
+- **Outcome:** Named strategy pack path always fetches orderbook, flow and liquidity; light packs no longer blank Desk whale/liq cards; test covers simple_core + ZEC.
+
+### WL-074: Tighten strategy prompt_rules + scalping buffer
+
+- **Context:** Stricter AI playbook invalidation for SMC, liquidity sweep, breakout, pullback/retracement and scalping; scalping stop_buffer_atr 0.20 to 0.25.
+- **Acceptance:** Updated prompt_rules in strategies.py; scalping buffer 0.25; tests still green; strategies feature note.
+- **Status:** done.
+- **Outcome:** Tightened SMC / sweep / breakout / pullback / retracement / scalping prompt_rules; scalping stop_buffer_atr 0.25; tests pin the new text and buffer.
+
+### WL-073: Signals coin multi-select filter
+
+- **Context:** Filter the Signals table (and open book / KPIs) by one or more coins.
+- **Acceptance:** Multi-select on Signals; AND with TF / strategy / status; options from loaded signals; empty selection = all coins.
+- **Status:** done.
+- **Outcome:** Coins Autocomplete multi-select on Signals; AND with TF/strategy/status; KPIs and open book follow the filter.
+
+### WL-072: Signals open-book overview cards
+
+- **Context:** After the table, show an overview of current open positions: mark R book, how many in profit / loss / flat, reviewed vs waiting.
+- **Acceptance:** Cards under the Signals table for the filtered open set; profit/loss counts with green/red tone; sum and average unrealized R; docs.
+- **Status:** done.
+- **Outcome:** Open book SectionCard under Signals table with profit/loss/flat counts and book/avg/best/worst mark R.
+
+### WL-071: Delete signal from UI (and related JSON)
+
+- **Context:** Sheryar wants to delete any signal from the portal, including its live-review and multi-analysis payloads stored on the row.
+- **Acceptance:** DELETE `/api/signals/{id}`; confirm dialog on Signals list and Signal detail; row and related JSON gone; stats refresh; docs; tests.
+- **Status:** done.
+- **Outcome:** `delete_signal` + DELETE `/api/signals/{id}`; list trash + detail Delete with confirm; docs and test.
+
+### WL-070: Signals live mark: row tint + unrealized R
+
+- **Context:** After live review, open signals that have not hit TP or stop should show current price vs locked entry, profit or loss tint on the whole row, and unrealized R if closed at that price.
+- **Acceptance:** Open + reviewed rows tint green (profit) or red (loss); Now column shows price and mark-to-market R; status/caption clarifies still open vs levels; docs note; gate green.
+- **Status:** done.
+- **Outcome:** Signals list and SignalDetail tint open reviewed rows by unrealized R vs locked entry; Now/R show mark-to-market; "Levels not hit" caption; docs updated.
+
+### WL-069: Hot tab: volatility coin finder
+
+- **Context:** Sheryar wants a Hot rail page to scan Majors / Mid / Alts for elevated or expanding volatility, rank a top N locally, optionally AI-brief the picks, and open winners on Desk for deep analysis.
+- **Acceptance:** `#/hot` page; POST `/api/hot/scan` and `/api/hot/ask`; category + top N + TF + optional custom symbols; local hot_score; AI brief when provider set; Open on Desk; tests; docs; gate green.
+- **Status:** done.
+- **Outcome:** `app/hot.py` + schemas + `/api/hot/scan` and `/ask`; React Hot page with Open on Desk; docs/features/hot.md linked from hubs; tests and gate green.
+
+### WL-068: Simple Core strategy pack
+
+- **Context:** Sheryar wants a lean EMA20/50 + RSI + ATR playbook as a named pack, with AI rules for trend alignment, momentum, score >= 8, 1.5 ATR stop and 1:2 R:R.
+- **Acceptance:** `simple_core` in registry and catalog; Desk/All pick it up; playbook + risk 1.5 ATR / 2R; tests; strategies + analysis-flow docs; gate green.
+- **Status:** done.
+- **Outcome:** Registered `simple_core` (follow Desk TF; EMA/RSI/ATR/swings; stop 1.4-1.6 ATR; min R:R 2). Docs strategies + analysis-flow AI note. Tests updated.
+
+### WL-067: Hybrid live review: rule stance + AI stance
+
+- **Context:** Rule stance stays audit-stable; Sheryar wants AI to also give a stance from frozen plan + latest review context (hybrid: Rules Hold · AI Caution).
+- **Acceptance:** AI prompt asks for stance + short reason; parse `ai_stance` / `ai_stance_reason`; keep rule `stance` unchanged; detail UI shows both chips; skipped/error when no AI; tests; docs; gate green.
+- **Status:** done.
+- **Outcome:** Prompt + `parse_live_review_ai`; review stores `ai_stance` / `ai_stance_reason`; detail shows Rules + AI chips; Signals list shows AI caption. 8 live-review tests; tsc 0.
+
+### WL-066: Live review cards UX + AI status + flow docs
+
+- **Context:** Live review advice is hard to scan; when entry is filled, SL/TP changes need clear cards. AI reasoning often shows offline/skipped without saying why (`AI_PROVIDER=cursor` is set). Sheryar also wants the end-to-end strategy/AI/levels flow documented.
+- **Acceptance:** review cards for Entry / Stop / Target (original vs suggested, locked entry when filled); surface AI provider/error; flow doc linked from features; gate green.
+- **Status:** done.
+- **Outcome:** Signal detail Entry/Stop/Target cards; entry locked when filled; `ai_status` / `ai_error` stamped; toast shows AI skip reason; docs `features/analysis-flow.md`. Tests + tsc green.
+
+### WL-065: Live review entry status unknown / missing advice
+
+- **Context:** Detail UI shows Entry unknown and Entry/Stop/Target dashes even when price and revised levels exist. Reviews were saved without `entry_status` / `level_advice` (stale API or UI fallback), so the chip defaulted to unknown.
+- **Acceptance:** always stamp entry_status and level_advice on new reviews; UI derives filled/waiting from signal entry + review price when the field is missing; re-review works; tests; docs note.
+- **Status:** done.
+- **Outcome:** Backend stamps `entry_status` / `level_advice` after revise merge; detail page derives filled/waiting and advice when older rows omit fields. Tests + tsc green.
+
+
+### WL-064: Strategy stop room, entry styles, richer live review
+
+- **Context:** Stops are too tight so signals stop out before TP. Entries are often the price at analysis time even when the playbook wants a limit/reclaim. Live review mostly shows Hold/Caution without clear entry/SL/TP change advice or AI reasoning.
+- **Acceptance:** Widen per-strategy stop bands with a buffer; entry_style market/limit/reclaim in risk + suggested levels + prompt; live review reports entry waiting/filled and advises on entry/SL/TP; AI short reasoning from original plan + review (skipped offline); Signals detail UI shows the advice; tests; docs; gate green.
+- **Status:** done.
+- **Outcome:** Wider ATR bands + `stop_buffer_atr`; entry styles on risk/suggested levels/prompt; live review `entry_status`, `level_advice`, optional `ai_reasoning`; Signals list + detail UI. 213 pytest; ruff/tsc/eslint/build 0. No incidents.
+
+### WL-063: Desk guard mode: enforce or AI only
+
+- **Context:** Sheryar wants a choice before Full analysis: keep deterministic guards (decision 0003) or keep the model bias and levels with no override, so AI quality can be judged without desk second-guessing.
+- **Acceptance:** Desk control Guards On / AI only; `guard_mode` on analyze request/response (default `enforce`); `ai_only` skips confluence, pack quality, trap and R:R bias flips and softens prompt MUST rules; still fills blank prices; multi-analyze respects the flag; tests; docs/decision note; gate green.
+- **Status:** done.
+- **Outcome:** `guard_mode` on analyze; Desk Guards select; `ai_only` skips post-AI overrides and softens prompt; decision 0009; tests in `test_guards`; 211 pytest; ruff/tsc/eslint/build 0; smoke offline both modes. No incidents.
+- **Files:** `backend/app/main.py`, `ai.py`, `multi_analyze.py`, `schemas.py`; `frontend/src/pages/Desk.tsx`, `api.ts`; `backend/tests/test_guards.py`; docs analysis-and-chat, api-reference, decisions 0003/0009, project-state.
+
+### WL-062: Backtest coin picker uses symbol search
+
+- **Context:** Coin field only suggested eight majors; users expect the same catalogue search as Desk.
+- **Acceptance:** type-ahead search via `/api/symbols/search`; multi-select; freeSolo still works; docs; typecheck.
+- **Status:** done.
+- **Outcome:** Backtests Coins Autocomplete debounces catalogue search (crypto/USDT); majors only as empty-state shortcuts.
+
+### WL-061: Tighten backtest entries after loss analysis
+
+- **Context:** Walk-forward runs show ~33% hit rate; most losses are stop tags. Breakout/ema_volatility near zero; trend rules fire while RSI sits in a wide band (state, not edge). Liquidity sweep can work but trend/scalp overtrade.
+- **Acceptance:** edge-triggered trend/mean signals; breakout needs ATR buffer and slope; wider stops for trend/breakout; re-run smoke backtest improves stop-out share or hit rate; tests; docs note.
+- **Status:** done.
+- **Outcome:** Loss analysis: most fails were stop tags; trend sat in RSI bands; breakouts were late. Fixed to EMA20 reclaim after soft RSI, mean RSI turns, fresh breakouts with ATR buffer, wider trend stops, per-bar edge scan with step cooldown. Smoke BTC/ETH/SOL 1h: hit ~48% avg R +0.17 (was ~37% / -0.08). Breakout packs still weak but rare.
+
+### WL-060: Backtest run detail page
+
+- **Context:** Users need a dedicated view per run (params, KPIs, by strategy/coin, full trade ledger), not only an inline dropdown.
+- **Acceptance:** hash route `#/backtests/{id}`; detail page with back link; list on Backtests opens it; gate green; docs.
+- **Status:** done.
+- **Outcome:** `BacktestDetail` at `#/backtests/{id}`; Saved runs table with Open; new run navigates to detail. Docs updated.
+
+### WL-059: Backtest timeframe option and saved run browser
+
+- **Context:** Walk-forward was hardcoded to 1h in the UI even though the API accepts timeframe. Past runs are stored but hard to reopen with full ledger.
+- **Acceptance:** timeframe select (15m to 1d); tape uses that TF; params and summary store timeframe; UI lists saved runs and loads trades for a chosen run; docs; tests.
+- **Status:** done.
+- **Outcome:** Timeframe control; tape + holdout use selected TF; summary/params store timeframe/symbols/strategies; Saved runs dropdown reloads ledger. Tests green.
+
+### WL-058: Backtest trade ledger and signal reasons
+
+- **Context:** Rankings alone do not show each plan, why the strategy fired, or why it lost. Coin field looked limited to the suggestion list.
+- **Acceptance:** any typed pair works with clear copy; each trade stores signal reason; UI trade table (side, levels, R, outcome, failure tag, reason); filter by strategy/coin; tests; docs.
+- **Status:** done.
+- **Outcome:** Migration 009 `signal_reason`; walk-forward stores rule text; Backtests trade ledger with filters and outcome explanations. Docs updated.
+
+### WL-057: Walk-forward backtests (pick coins, hide future bars)
+
+- **Context:** WL-056 replays fixed majors with full-series indicators. Sheryar wants to pick one or more coins and strategies, hide future candles from the signal engine, generate plans on the visible tape only, then score those plans on the hidden bars so bad strategies can be improved later.
+- **Acceptance:** multi-select symbols; multi-select strategies plus all; walk-forward (visible slice only for signal, hidden bars for outcome); results by strategy and by coin; UI updated; tests; gate green.
+- **Status:** done.
+- **Outcome:** Walk-forward engine (`walk_forward_symbol`); API accepts `symbols`, `strategy_ids`, `bars`, `step`; Backtests UI multi coin/strategy; summary `by_strategy` + `by_symbol`. Tests 5; ruff 0. Docs features/backtests updated.
+
+### WL-055: Harden win rate and R:R (archive, traps, verify)
+
+- **Context:** Live hit rate and average R are weak: desk-rejected Neutrals still archive, hard R:R is 1:1, named packs skip chop, verify is harsh on 1m wicks, and Binance Data-tab squeeze/flow is soft only.
+- **Acceptance:** post-guard Neutral not archived; strategy min R:R (desk 1.5); trade_allowed enforced on named packs; desk soft band |score| less than 3.0; signal-TF verify horizons; spot/futures trap gate forces Neutral on cascade/squeeze against the trade; tests and docs; gate green.
+- **Status:** done.
+- **Outcome:** Archive only post-guard Buy/Sell; R:R floor desk 1.5 / strategy `min_reward_risk`; soft band |score| less than 3.0; `traps.py` + dual spot/futures books; pack quality on named packs; verify walks signal TF horizons; Desk Liquidity card shows spot/futures books and trap flags. Tests `test_guards` / `test_traps`; 203 pytest; ruff 0; frontend build 0.
+
+### WL-056: Backtests module (shallow/deep, ranking, charts)
+
+- **Context:** Need measured strategy rankings and a manual Backtests page (shallow/deep, all or one strategy, charts) that feeds multi-optimize and later WL-034.
+- **Acceptance:** offline engine; POST run + ranking API; Backtests page with ranking and charts; pack_score uses rankings when n >= 20; gate green.
+- **Status:** done.
+- **Outcome:** `backtest_engine.py` + `backtests.py`; migration 008; POST/GET backtests APIs; Backtests page with ranking table and charts; `pack_score` ranking boost when n ≥ 20. Tests `test_backtests`; 207 pytest; ruff 0; frontend build 0. Docs features/backtests.
 
 ### WL-054: Multi-strategy analysis + signal detail page
 
@@ -199,9 +417,9 @@ Items WL-001 to WL-014 were logged retroactively on 2026-10-21, when the ruleset
 
 ### WL-034: Analysis names the best strategies for this trade, with win rates
 
-- **Context:** Sheryar wants each trade suggestion to say which strategies fit this trade best and their win rate. The setup classifier already labels the tape (trend, breakout, range, chop); WL-033 provides win rates per strategy, style and coin group.
+- **Context:** Sheryar wants each trade suggestion to say which strategies fit this trade best and their win rate. The setup classifier already labels the tape (trend, breakout, range, chop); WL-056 now supplies offline rankings (n ≥ 20 for reliable rates). WL-033 remains the deeper style x coin-group matrix if still wanted.
 - **Acceptance:** `/api/analyze` returns the top 3 matching strategies with backtested win rate, sample size and why each fits; the prompt includes them so the AI reply names them; the desk card shows them in both UIs; a strategy with fewer than 20 backtest trades shows its win rate as `na("too few trades")`; API contract updated (ruleset 8); gate green.
-- **Status:** open; after WL-031, WL-033.
+- **Status:** open; after WL-056 (rankings ready).
 
 ### WL-033: Backtester: "Bhalu trades", 50 per strategy per style
 

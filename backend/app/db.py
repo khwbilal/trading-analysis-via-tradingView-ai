@@ -43,10 +43,13 @@ SIGNAL_COLUMNS = (
     "id", "created_at", "symbol", "timeframe", "bias", "entry", "stop_loss", "take_profit",
     "price_at_signal", "setup", "trade_allowed", "confluence", "confidence", "status",
     "outcome", "verified_at", "bars_checked", "hit_price", "hit_at", "r_multiple", "notes",
-    "strategy_id", "live_review_json", "multi_analysis_json",
+    "strategy_id", "live_review_json", "multi_analysis_json", "market_context_json",
 )
 BOOL_COLUMNS = {"signals": ("trade_allowed",)}
-JSON_COLUMNS = {"signals": ("live_review_json", "multi_analysis_json")}
+JSON_COLUMNS = {
+    "signals": ("live_review_json", "multi_analysis_json", "market_context_json"),
+    "backtest_runs": ("summary_json", "params_json"),
+}
 
 
 def db_path() -> Path:
@@ -158,8 +161,8 @@ def from_db(table: str, row: dict[str, Any] | None) -> dict[str, Any] | None:
             row[col] = bool(row[col])
     for col in JSON_COLUMNS.get(table, ()):
         raw = row.get(col)
-        # live_review_json is a list; multi_analysis_json is an object or null.
-        empty: Any = None if col == "multi_analysis_json" else []
+        # live_review_json is a list; object JSON cols default to null.
+        empty: Any = [] if col == "live_review_json" else None
         if isinstance(raw, str) and raw.strip():
             try:
                 row[col] = json.loads(raw)

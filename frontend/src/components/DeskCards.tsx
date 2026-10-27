@@ -302,7 +302,10 @@ export function FlowCard({ market }: Readonly<{ market: Market | null }>) {
 export function LiquidityCard({ market }: Readonly<{ market: Market | null }>) {
   const liq = market?.liquidity ?? {};
   const book = market?.orderbook ?? {};
-  if (!liq.available && !book.available) {
+  const bookSpot = market?.orderbook_spot ?? book.orderbook_spot ?? {};
+  const bookFut = market?.orderbook_futures ?? book.orderbook_futures ?? {};
+  const traps = market?.traps ?? {};
+  if (!liq.available && !book.available && !traps.available) {
     return (
       <SectionCard title="Liquidity & order book" icon={<WaterDropOutlined />}>
         <EmptyState text="Estimated liquidation clusters (long cascade vs short squeeze) and depth imbalance." icon={<WaterDropOutlined />} />
@@ -313,6 +316,7 @@ export function LiquidityCard({ market }: Readonly<{ market: Market | null }>) {
   const ns = liq.nearest_short_liq ?? {};
   const lc = liq.cascade?.long_cascade_trigger ?? {};
   const sq = liq.cascade?.short_squeeze_trigger ?? {};
+  const trapTags = Array.isArray(traps.tags) ? traps.tags.filter(Boolean) : [];
   return (
     <SectionCard title="Liquidity & order book" icon={<WaterDropOutlined />}>
       <Dl>
@@ -346,12 +350,27 @@ export function LiquidityCard({ market }: Readonly<{ market: Market | null }>) {
             <Na />
           )}
         </Dd>
-        <Dd label="Order book">{book.available ? (book.bias ?? <Na />) : <Na reason="Depth unavailable" />}</Dd>
+        <Dd label="Futures book">
+          {bookFut.available ? (bookFut.bias ?? book.bias ?? <Na />) : book.available ? (book.bias ?? <Na />) : <Na reason="Depth unavailable" />}
+        </Dd>
+        <Dd label="Spot book">{bookSpot.available ? (bookSpot.bias ?? <Na />) : <Na reason="Spot depth unavailable" />}</Dd>
         <Dd label="Book imbalance">
           {book.available && isNum(book.imbalance) ? <Num>{fmtPct(book.imbalance * 100, 1)}</Num> : <Na />}
         </Dd>
+        <Dd label="Trap flags">
+          {trapTags.length ? <Num>{trapTags.join(", ")}</Num> : <Na reason="No trap flags" />}
+        </Dd>
+        <Dd label="Blocks">
+          {traps.block_buy || traps.block_sell ? (
+            <Num>
+              {[traps.block_buy ? "Buy" : null, traps.block_sell ? "Sell" : null].filter(Boolean).join(" · ")}
+            </Num>
+          ) : (
+            <Na reason="No side blocked" />
+          )}
+        </Dd>
       </Dl>
-      <Summary text={liq.summary} />
+      <Summary text={[liq.summary, traps.summary].filter(Boolean).join(" · ") || undefined} />
     </SectionCard>
   );
 }

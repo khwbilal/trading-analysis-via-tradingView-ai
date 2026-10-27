@@ -2,6 +2,8 @@
 export const PAGES = {
   desk: "Desk",
   dashboard: "Dashboard",
+  backtests: "Backtests",
+  hot: "Hot",
   watchlist: "Watchlist",
   calendar: "Calendar",
   journal: "Journal",

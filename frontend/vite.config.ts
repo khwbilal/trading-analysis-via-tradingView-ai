@@ -7,8 +7,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        // :8000 has stuck zombie listeners with old code; current API is on :8002.
-        target: "http://127.0.0.1:8002",
+        // :8000 has stuck zombie listeners with old code; :8002 often fails to bind on this machine.
+        target: "http://127.0.0.1:8003",
         changeOrigin: true,
       },
     },

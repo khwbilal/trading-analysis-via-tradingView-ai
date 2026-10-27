@@ -26,6 +26,7 @@ Added in WL-018. Tests live in `backend/tests/` and never touch the network, a b
 | `test_prompt_block.py` | `market.context_to_prompt_block` | Pair, timeframe, price, `setup` and `confluence` first; empty values dropped, `False` and `0` kept; low-value sections dropped whole; the hard cut keeps `setup` and `confluence` ([incident WL-012](incidents/WL-012.md)) |
 | `test_symbols.py` | `symbols.search_symbols` | `<q>USDT` first, the selected exchange first, `ALL` means no preference, perp boost, dedupe, limit, caching, no `ALL:` pseudo-exchange |
 | `test_choose_provider.py` | `choose_provider.set_env_values` | A missing file is created, other lines and comments kept, duplicate keys all updated, new keys appended in order |
+| `test_hot.py` | `hot.compute_hot_score`, bucketing, `run_hot_scan` | Score bounds; majors/mid/alts buckets; custom universe; AI brief skipped when `with_ai_brief=false` (WL-069) |
 
 `tests/conftest.py` has one fixture that applies to every test:
 

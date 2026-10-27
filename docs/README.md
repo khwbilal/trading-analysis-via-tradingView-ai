@@ -43,11 +43,14 @@ A local crypto analysis desk: a live TradingView chart next to an AI analyst. Th
 | Feature | What it does |
 |---|---|
 | [Analysis & chat](features/analysis-and-chat.md) | Full analysis → trade plan (bias, entry, stop, target), then follow-up Q&A |
+| [Analysis flow](features/analysis-flow.md) | Where data comes from, when AI runs, how entry/stop/target are set and reviewed |
 | [Strategies](features/strategies.md) | GPTChart-style packs (SMC, scalping, breakout, …) plus Desk default; Signals filter by strategy |
 | [Dashboard](features/dashboard.md) | Hit rate, R and charts by strategy from the signal archive |
+| [Backtests](features/backtests.md) | Offline shallow/deep strategy replay, rankings and charts (WL-056) |
 | [Confluence score](features/confluence-score.md) | Weighted −10…+10 score that the AI is not allowed to contradict |
 | [Setup classifier](features/setup-classifier.md) | Chop / mean-revert / breakout / trend continuation, plus the chop filter |
 | [Flow, order book & liquidity](features/flow-and-liquidity.md) | Whale vs retail positioning, funding, OI, depth imbalance, liquidation clusters |
+| [Hot volatility scanner](features/hot.md) | Ranks Majors / Mid / Alts by local volatility; optional AI brief; open on Desk (WL-069) |
 | [Watchlist scorer](features/watchlist.md) | Ranks ten majors by setup quality |
 | [Trade journal](features/journal.md) | Log plans, close them as win/loss/BE, track hit rate and R |
 | [Signal verification](features/signals.md) | Auto-archives every Buy/Sell and checks it against later candles |

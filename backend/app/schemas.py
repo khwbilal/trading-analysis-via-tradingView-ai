@@ -17,6 +17,14 @@ class AnalyzeRequest(BaseModel):
         examples=["local_score", "ai_ensemble", "majority_vote"],
         description="Only used when strategy_id is 'all'.",
     )
+    guard_mode: str = Field(
+        default="enforce",
+        examples=["enforce", "ai_only"],
+        description=(
+            "enforce: post-AI confluence / R:R / trap guards may change bias (default). "
+            "ai_only: keep the model bias and levels; no override."
+        ),
+    )
     custom_prompt: str | None = None
 
 
@@ -62,6 +70,7 @@ class AnalyzeResponse(BaseModel):
     levels: TradeLevels
     analysis: str
     provider: str
+    guard_mode: str = "enforce"
     optimize_mode: str | None = None
     final_strategy_id: str | None = None
     packs: list[dict[str, Any]] | None = None
@@ -76,10 +85,13 @@ class ChatResponse(BaseModel):
 
 
 class StrategyRiskInfo(BaseModel):
-    stop_atr_min: float = 0.75
-    stop_atr_max: float = 2.0
+    stop_atr_min: float = 1.0
+    stop_atr_max: float = 2.5
+    stop_buffer_atr: float = 0.25
     min_reward_risk: float = 1.5
     target_r_min: float = 2.0
+    entry_style: str = "market"
+    entry_offset_atr: float = 0.35
     review_near_stop_r: float = 0.35
     review_hold_min_r: float = -0.35
     review_hold_max_r: float = 0.70
@@ -225,6 +237,22 @@ class WatchlistRequest(BaseModel):
     timeframe: str = "1h"
 
 
+class HotScanRequest(BaseModel):
+    category: Literal["majors", "mid", "alts", "all"] = "majors"
+    top_n: int = Field(default=10, ge=5, le=20)
+    timeframe: str = Field(default="1h", description="15m, 1h, or 4h")
+    symbols: list[str] | None = Field(
+        default=None,
+        description="Optional custom universe; overrides category buckets for this run.",
+    )
+    with_ai_brief: bool = True
+
+
+class HotAskRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    scan_context: dict | None = None
+
+
 class JournalCreate(BaseModel):
     symbol: str
     timeframe: str = "1h"
@@ -240,3 +268,25 @@ class JournalCreate(BaseModel):
 class JournalClose(BaseModel):
     status: Literal["win", "loss", "be", "skipped"]
     exit_price: float | None = None
+
+
+class BacktestRunRequest(BaseModel):
+    mode: Literal["custom", "shallow", "deep"] = "custom"
+    symbols: list[str] = Field(
+        default_factory=list,
+        description="Coins to test (e.g. BTCUSDT). Required for custom; shallow/deep fill defaults if empty.",
+    )
+    strategy_ids: list[str] = Field(
+        default_factory=lambda: ["all"],
+        description="Strategy ids to run, or include 'all'.",
+    )
+    strategy_id: str | None = Field(
+        default=None,
+        description="Legacy single id; prefer strategy_ids.",
+    )
+    bars: int | None = Field(default=220, ge=80, le=1000)
+    step: int = Field(default=12, ge=1, le=48, description="Bars between walk-forward decisions")
+    timeframe: str = Field(
+        default="1h",
+        description="Candle timeframe for the walk-forward tape (15m, 30m, 1h, 2h, 4h, 1d).",
+    )

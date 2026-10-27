@@ -97,6 +97,9 @@ def _apply_risk_to_coin(coin: dict[str, Any] | None, strategy) -> dict[str, Any]
         stop_atr_min=r.stop_atr_min,
         stop_atr_max=r.stop_atr_max,
         target_r_min=r.target_r_min,
+        stop_buffer_atr=r.stop_buffer_atr,
+        entry_style=r.entry_style,
+        entry_offset_atr=r.entry_offset_atr,
     )
 
 
@@ -140,6 +143,9 @@ def _build_named_strategy_pack(
                 stop_atr_min=risk.stop_atr_min,
                 stop_atr_max=risk.stop_atr_max,
                 target_r_min=risk.target_r_min,
+                stop_buffer_atr=risk.stop_buffer_atr,
+                entry_style=risk.entry_style,
+                entry_offset_atr=risk.entry_offset_atr,
             )
             frames[tf] = pick_indicator_blocks(analysis, strategy.indicators)
             if tf == primary_tf:
@@ -182,41 +188,43 @@ def _build_named_strategy_pack(
         "timeframes": {n["tf"]: n for n in mtf_notes},
     }
 
-    if strategy.needs_orderbook:
-        try:
-            from .orderbook import fetch_orderbook_imbalance
+    # Always attach book / flow / liquidity for Desk cards and prompt context (WL-075).
+    # needs_orderbook / needs_liquidity used to skip these on light packs, which left
+    # whales and liquidation empty even when Binance Futures listed the pair (e.g. ZEC).
+    try:
+        from .orderbook import fetch_orderbook_imbalance
 
-            context["orderbook"] = fetch_orderbook_imbalance(pair)
-        except Exception as exc:  # noqa: BLE001
-            context["orderbook"] = {"available": False, "error": str(exc)}
+        context["orderbook"] = fetch_orderbook_imbalance(pair)
+    except Exception as exc:  # noqa: BLE001
+        context["orderbook"] = {"available": False, "error": str(exc)}
 
-    if strategy.needs_liquidity:
-        try:
-            from .flow import fetch_flow_snapshot
-            from .liquidity import fetch_liquidity_map
+    try:
+        from .flow import fetch_flow_snapshot
+        from .liquidity import fetch_liquidity_map
 
-            flow = fetch_flow_snapshot(pair, primary_tf)
-            context["flow"] = flow
-            book = context.get("orderbook") if isinstance(context.get("orderbook"), dict) else {}
-            context["liquidity"] = fetch_liquidity_map(
-                pair,
-                mark_price=flow.get("mark_price"),
-                open_interest=flow.get("open_interest"),
-                whale_long_pct=flow.get("whale_long_pct"),
-                retail_long_pct=flow.get("retail_long_pct"),
-                funding_rate=flow.get("funding_rate"),
-                oi_change_pct=flow.get("oi_change_pct"),
-                price_change_24h_pct=flow.get("price_change_24h_pct"),
-                orderbook=book,
-                coinglass_api_key=getattr(settings, "coinglass_api_key", None),
-            )
-        except Exception as exc:  # noqa: BLE001
-            context["liquidity"] = {"available": False, "error": str(exc)}
-            context.setdefault("flow", {"available": False})
+        flow = fetch_flow_snapshot(pair, primary_tf)
+        context["flow"] = flow
+        book = context.get("orderbook") if isinstance(context.get("orderbook"), dict) else {}
+        context["liquidity"] = fetch_liquidity_map(
+            pair,
+            mark_price=flow.get("mark_price"),
+            open_interest=flow.get("open_interest"),
+            whale_long_pct=flow.get("whale_long_pct"),
+            retail_long_pct=flow.get("retail_long_pct"),
+            funding_rate=flow.get("funding_rate"),
+            oi_change_pct=flow.get("oi_change_pct"),
+            price_change_24h_pct=flow.get("price_change_24h_pct"),
+            orderbook=book,
+            coinglass_api_key=getattr(settings, "coinglass_api_key", None),
+        )
+    except Exception as exc:  # noqa: BLE001
+        context["liquidity"] = {"available": False, "error": str(exc)}
+        context.setdefault("flow", {"available": False})
 
     # Soft fit score from primary structure / ADX / squeeze so the model has a bias hint
     # without desk chop / confluence hard Neutral.
-    fit = _strategy_fit(strategy.id, primary if isinstance(primary, dict) else {})
+    flow = context.get("flow") if isinstance(context.get("flow"), dict) else None
+    fit = _strategy_fit(strategy.id, primary if isinstance(primary, dict) else {}, flow=flow)
     context["strategy_fit"] = fit
     context["setup"] = {
         "type": strategy.id,
@@ -237,32 +245,10 @@ def _build_named_strategy_pack(
         if px:
             context["yahoo_price"] = {"price": px, "source": "binance_local"}
 
-    return context
+    return _attach_books_and_traps(context)
 
 
-def _strategy_fit(strategy_id: str, primary: dict[str, Any]) -> dict[str, Any]:
-    """Lightweight bias hint for named strategies (not the desk confluence engine)."""
-    struct = primary.get("structure") if isinstance(primary.get("structure"), dict) else {}
-    adx = primary.get("adx") if isinstance(primary.get("adx"), dict) else {}
-    squeeze = primary.get("squeeze") if isinstance(primary.get("squeeze"), dict) else {}
-    rvol = primary.get("relative_volume")
-    bias = struct.get("bias") or "Neutral"
-    score = 0.0
-    if bias == "Bullish":
-        score += 2.5
-    elif bias == "Bearish":
-        score -= 2.5
-    if struct.get("bos"):
-        score += 1.5 if struct.get("bos") == "bullish" else -1.5
-    if struct.get("choch"):
-        score += 1.0 if struct.get("choch") == "bullish" else -1.0
-    adx_val = adx.get("value")
-    if isinstance(adx_val, (int, float)) and adx_val >= 20:
-        score *= 1.15
-    if strategy_id == "ema_volatility" and squeeze.get("active"):
-        score *= 0.5  # wait for expansion
-    if strategy_id == "breakout" and isinstance(rvol, (int, float)) and rvol < 1.0:
-        score *= 0.6
+def _fit_result(strategy_id: str, score: float, summary: str) -> dict[str, Any]:
     score = round(max(-8.0, min(8.0, score)), 2)
     out_bias = "Neutral"
     if score >= 2.5:
@@ -275,11 +261,132 @@ def _strategy_fit(strategy_id: str, primary: dict[str, Any]) -> dict[str, Any]:
         "bias": out_bias,
         "confidence": round(min(0.85, 0.35 + abs(score) / 12), 2),
         "trade_allowed": trade_allowed,
-        "summary": (
-            f"{strategy_id} fit {score:+.1f}; structure={struct.get('note') or bias}; "
-            f"trade_ok={trade_allowed}"
-        ),
+        "summary": f"{strategy_id} fit {score:+.1f}; {summary}; trade_ok={trade_allowed}",
     }
+
+
+def _num(val: Any) -> float | None:
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return float(val)
+    return None
+
+
+def _strategy_fit(
+    strategy_id: str,
+    primary: dict[str, Any],
+    flow: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Lightweight bias hint for named strategies (not the desk confluence engine)."""
+    struct = primary.get("structure") if isinstance(primary.get("structure"), dict) else {}
+    adx = primary.get("adx") if isinstance(primary.get("adx"), dict) else {}
+    squeeze = primary.get("squeeze") if isinstance(primary.get("squeeze"), dict) else {}
+    rvol = primary.get("relative_volume")
+    bias = struct.get("bias") or "Neutral"
+    adx_val = adx.get("value")
+
+    if strategy_id == "range_fade":
+        bb = primary.get("bollinger") if isinstance(primary.get("bollinger"), dict) else {}
+        pct = _num(bb.get("percent_b"))
+        if not isinstance(adx_val, (int, float)) or adx_val >= 22:
+            return _fit_result(strategy_id, 0.0, "ADX not quiet")
+        if isinstance(rvol, (int, float)) and rvol >= 1.6:
+            return _fit_result(strategy_id, 0.0, "volume expanded")
+        if pct is not None and pct <= 0.1:
+            return _fit_result(strategy_id, 3.2, "lower band extreme")
+        if pct is not None and pct >= 0.9:
+            return _fit_result(strategy_id, -3.2, "upper band extreme")
+        return _fit_result(strategy_id, 0.0, "mid range")
+
+    if strategy_id == "session_box":
+        box = primary.get("session_box") if isinstance(primary.get("session_box"), dict) else {}
+        if not box.get("available"):
+            return _fit_result(strategy_id, 0.0, "no Asia box")
+        if box.get("window") not in ("london", "new_york"):
+            return _fit_result(strategy_id, 0.0, "outside London or New York")
+        if not isinstance(rvol, (int, float)) or rvol < 1.2:
+            return _fit_result(strategy_id, 0.0, "volume not elevated")
+        if box.get("location") == "above":
+            return _fit_result(strategy_id, 3.4, "above Asia high with volume")
+        if box.get("location") == "below":
+            return _fit_result(strategy_id, -3.4, "below Asia low with volume")
+        return _fit_result(strategy_id, 0.0, "still inside the box")
+
+    if strategy_id == "fvg":
+        gaps = (
+            primary.get("fair_value_gaps")
+            if isinstance(primary.get("fair_value_gaps"), dict)
+            else {}
+        )
+        nearest = gaps.get("nearest") if isinstance(gaps.get("nearest"), dict) else None
+        if not nearest:
+            return _fit_result(strategy_id, 0.0, "no unfilled gap")
+        side = nearest.get("side")
+        if side == "bullish" and bias == "Bullish":
+            return _fit_result(strategy_id, 3.2, "bullish gap with bullish structure")
+        if side == "bearish" and bias == "Bearish":
+            return _fit_result(strategy_id, -3.2, "bearish gap with bearish structure")
+        return _fit_result(strategy_id, 0.0, "gap disagrees with structure")
+
+    if strategy_id == "day_fade":
+        levels = primary.get("day_levels") if isinstance(primary.get("day_levels"), dict) else {}
+        if not levels.get("available"):
+            return _fit_result(strategy_id, 0.0, "no prior day levels")
+        if levels.get("reject_prior_high"):
+            return _fit_result(strategy_id, -3.3, "reject prior day high")
+        if levels.get("reject_prior_low"):
+            return _fit_result(strategy_id, 3.3, "reject prior day low")
+        return _fit_result(strategy_id, 0.0, "no rejection of an obvious level")
+
+    if strategy_id == "crowded_fade":
+        snap = flow or {}
+        whale = _num(snap.get("whale_long_pct"))
+        funding = _num(snap.get("funding_rate"))
+        oi_chg = _num(snap.get("oi_change_pct"))
+        bos = struct.get("bos")
+        crowded_long = (
+            whale is not None
+            and whale >= 62
+            and funding is not None
+            and funding > 0.0001
+            and oi_chg is not None
+            and oi_chg > 2
+            and bos != "bullish"
+        )
+        crowded_short = (
+            whale is not None
+            and whale <= 38
+            and funding is not None
+            and funding < -0.0001
+            and oi_chg is not None
+            and oi_chg > 2
+            and bos != "bearish"
+        )
+        if crowded_long:
+            return _fit_result(strategy_id, -3.4, "crowded longs, no bullish acceptance")
+        if crowded_short:
+            return _fit_result(strategy_id, 3.4, "crowded shorts, no bearish acceptance")
+        return _fit_result(strategy_id, 0.0, "positioning not crowded or price accepted")
+
+    score = 0.0
+    if bias == "Bullish":
+        score += 2.5
+    elif bias == "Bearish":
+        score -= 2.5
+    if struct.get("bos"):
+        score += 1.5 if struct.get("bos") == "bullish" else -1.5
+    if struct.get("choch"):
+        score += 1.0 if struct.get("choch") == "bullish" else -1.0
+    if isinstance(adx_val, (int, float)) and adx_val >= 20:
+        score *= 1.15
+    if strategy_id == "ema_volatility" and squeeze.get("active"):
+        score *= 0.5  # wait for expansion
+    if strategy_id == "breakout" and isinstance(rvol, (int, float)) and rvol < 1.0:
+        score *= 0.6
+    return _fit_result(
+        strategy_id,
+        score,
+        f"structure={struct.get('note') or bias}",
+    )
 
 
 def fetch_coin_context(
@@ -337,6 +444,9 @@ def fetch_coin_context(
                 stop_atr_min=risk.stop_atr_min,
                 stop_atr_max=risk.stop_atr_max,
                 target_r_min=risk.target_r_min,
+                stop_buffer_atr=risk.stop_buffer_atr,
+                entry_style=risk.entry_style,
+                entry_offset_atr=risk.entry_offset_atr,
             )
             # Keep TV error note but prefer local indicators
             if isinstance(coin, dict) and coin.get("error"):
@@ -357,6 +467,9 @@ def fetch_coin_context(
                 stop_atr_min=risk.stop_atr_min,
                 stop_atr_max=risk.stop_atr_max,
                 target_r_min=risk.target_r_min,
+                stop_buffer_atr=risk.stop_buffer_atr,
+                entry_style=risk.entry_style,
+                entry_offset_atr=risk.entry_offset_atr,
             )
             if isinstance(coin, dict):
                 for key in (
@@ -512,6 +625,23 @@ def fetch_coin_context(
         logger.warning("correlation failed: %s", exc)
         context["correlation"] = {"available": False, "error": str(exc)}
 
+    return _attach_books_and_traps(context)
+
+
+def _attach_books_and_traps(context: dict[str, Any]) -> dict[str, Any]:
+    """Lift dual books to top level and classify squeeze/trap flags (WL-055)."""
+    book = context.get("orderbook") if isinstance(context.get("orderbook"), dict) else {}
+    if "orderbook_spot" not in context and isinstance(book.get("orderbook_spot"), dict):
+        context["orderbook_spot"] = book["orderbook_spot"]
+    if "orderbook_futures" not in context and isinstance(book.get("orderbook_futures"), dict):
+        context["orderbook_futures"] = book["orderbook_futures"]
+    try:
+        from .traps import classify_traps
+
+        context["traps"] = classify_traps(context)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("traps classify failed: %s", exc)
+        context["traps"] = {"available": False, "tags": [], "summary": str(exc)}
     return context
 
 
@@ -679,6 +809,15 @@ def condense_market_context(context: dict[str, Any]) -> dict[str, Any]:
         }
         if (context.get("liquidity") or {}).get("available")
         else {"available": False},
+        "traps": {
+            "available": (context.get("traps") or {}).get("available"),
+            "tags": (context.get("traps") or {}).get("tags"),
+            "block_buy": (context.get("traps") or {}).get("block_buy"),
+            "block_sell": (context.get("traps") or {}).get("block_sell"),
+            "summary": (context.get("traps") or {}).get("summary"),
+        }
+        if isinstance(context.get("traps"), dict)
+        else {"available": False},
         "setup": {
             "type": (context.get("setup") or {}).get("type"),
             "trade_allowed": (context.get("setup") or {}).get("trade_allowed"),
@@ -774,6 +913,7 @@ _PROMPT_DROP_ORDER = (
     # strategy_pack stays until late so multi-TF frames survive trimming
     "flow",
     "liquidity",
+    "traps",
     "strategy_pack",
 )
 _TRUNC_MARKER = " …[truncated]"

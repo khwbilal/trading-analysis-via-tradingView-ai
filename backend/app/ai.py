@@ -31,11 +31,15 @@ Hard rules:
   * You may keep Buy/Sell only when confluence agrees OR score |x|>=2.5.
   * Do NOT flip to the opposite of confluence.bias.
 - Match plan style to setup.type: trend_continuation / breakout / mean_revert / chop.
-- Give one primary trade plan with entry, stop_loss, take_profit as real prices near the snapshot price.
+- Give one primary trade plan with entry, stop_loss, take_profit as real prices.
 - Never use entry/stop/target = 0. Prefer snapshot.level_hints / pivots / S-R.
+- Entry follows strategy_risk.entry_style when present: market = confirming print;
+  limit = wait into value (support for Buy / resistance for Sell); reclaim = after sweep.
+  Do NOT always set entry to the live print when style is limit or reclaim.
 - Stop and R:R follow STRATEGY risk when present (strategy_risk / RISK line): stop beyond
-  structure within stop_atr_min..stop_atr_max ATR of entry; min R:R from min_reward_risk.
-  If no such target exists, bias MUST be Neutral. Default when risk missing: 0.75..2 ATR, 1.5:1.
+  structure within stop_atr_min..stop_atr_max ATR of entry, plus stop_buffer_atr room so
+  noise wicks are less likely to tag; min R:R from min_reward_risk.
+  If no such target exists, bias MUST be Neutral. Default when risk missing: 1..2.5 ATR, 1.5:1.
 - Weigh: setup, confluence, mtf, ADX, BB, VWAP, orderbook, liquidity map (long-cascade vs short-squeeze magnets), whales/funding/OI, regime.
 - If liquidity.bias is Short-squeeze bias, favor longs only with confluence support; Long-cascade bias favors shorts/caution on longs.
 - data_source binance_local is valid.
@@ -84,19 +88,33 @@ def build_analysis_prompt(
     strategy_label: str = "Desk (default)",
     strategy_rules: str | None = None,
     uses_desk_pipeline: bool = True,
-    stop_atr_min: float = 0.75,
-    stop_atr_max: float = 2.0,
+    stop_atr_min: float = 1.0,
+    stop_atr_max: float = 2.5,
     min_reward_risk: float = 1.5,
+    guard_mode: str = "enforce",
+    stop_buffer_atr: float = 0.25,
+    entry_style: str = "market",
+    entry_offset_atr: float = 0.35,
 ) -> str:
     extra = f"\nTrader notes: {custom_prompt}" if custom_prompt else ""
     strategy_block = f"STRATEGY: {strategy_label} ({strategy_id})"
     if strategy_rules:
         strategy_block += f"\n{strategy_rules}"
     strategy_block += (
-        f"\nRISK: stop within {stop_atr_min:g}..{stop_atr_max:g} ATR of entry; "
-        f"min R:R {min_reward_risk:g}:1 (else Neutral)."
+        f"\nRISK: stop within {stop_atr_min:g}..{stop_atr_max:g} ATR of entry "
+        f"(plus ~{stop_buffer_atr:g} ATR buffer beyond structure); "
+        f"min R:R {min_reward_risk:g}:1 (else Neutral). "
+        f"ENTRY STYLE: {entry_style} (offset ~{entry_offset_atr:g} ATR when limit/reclaim)."
     )
-    if uses_desk_pipeline:
+    ai_only = (guard_mode or "enforce").strip().lower().replace("-", "_") == "ai_only"
+    if ai_only:
+        guard = (
+            "GUARD MODE ai_only: YOU own bias, entry, stop_loss and take_profit. "
+            "Confluence, chop and setup.trade_allowed are advisory context only "
+            "(override the CRITICAL confluence MUST lines in the system prompt for this run). "
+            "Still give real prices near the snapshot; prefer strategy RISK bands when they fit."
+        )
+    elif uses_desk_pipeline:
         guard = "Obey confluence + chop guardrails."
     else:
         guard = (
@@ -116,6 +134,90 @@ Market snapshot (includes setup, confluence or strategy_fit, MTF / strategy_pack
 Follow BIAS/SETUP/SCORE/TREND/MTF/BOOK/LIQ/FLOW/REGIME/ENTRY/STOP/TARGET/SUPPORT/RESISTANCE.
 {guard} Keep it scannable.
 """
+
+
+def build_live_review_prompt(signal: dict[str, Any], review: dict[str, Any]) -> str:
+    """Hybrid live review: AI stance + reason beside the rule stance (WL-067)."""
+    advice = review.get("level_advice") if isinstance(review.get("level_advice"), dict) else {}
+    return f"""Live review of an OPEN crypto signal. Original plan is frozen.
+
+Original: {signal.get('symbol')} {signal.get('timeframe')} {signal.get('bias')}
+strategy={signal.get('strategy_id') or 'desk'}
+entry={signal.get('entry')} stop={signal.get('stop_loss')} target={signal.get('take_profit')}
+notes={str(signal.get('notes') or '')[:240]}
+
+Live (deterministic desk already computed):
+price={review.get('price')} rule_stance={review.get('stance')}
+unrealized_r={review.get('unrealized_r')} entry_status={review.get('entry_status')}
+summary={review.get('summary')}
+level_advice={advice}
+revised_entry={review.get('revised_entry')} revised_sl={review.get('revised_stop_loss')} revised_tp={review.get('revised_take_profit')}
+
+Give YOUR stance independently (you may agree or disagree with rule_stance).
+Use exactly one of: hold | caution | exit_early | wait_entry
+- wait_entry only if entry is not filled yet and chasing is wrong
+- exit_early if banking or cutting makes more sense than the rule band
+- caution if structure/flow looks fragile even when rules say hold
+
+Reply with a short prose reason (under 100 words), then end with ONLY this JSON fence:
+```json
+{{"ai_stance":"hold|caution|exit_early|wait_entry","reasoning":"one or two short sentences"}}
+```
+No disclaimers.
+"""
+
+
+_AI_STANCES = frozenset({"hold", "caution", "exit_early", "wait_entry"})
+
+
+def parse_live_review_ai(text: str) -> dict[str, Any]:
+    """Extract ai_stance + reasoning from live-review model text (WL-067)."""
+    out: dict[str, Any] = {
+        "ai_stance": None,
+        "ai_stance_reason": None,
+        "ai_reasoning": (text or "").strip()[:1200] or None,
+    }
+    raw = text or ""
+    m = re.search(r"```json\s*(\{.*?\})\s*```", raw, re.S | re.I)
+    blob = m.group(1) if m else None
+    if not blob:
+        m2 = re.search(
+            r'\{\s*"ai_stance"\s*:\s*"(hold|caution|exit_early|wait_entry)".*?\}',
+            raw,
+            re.S | re.I,
+        )
+        blob = m2.group(0) if m2 else None
+    if blob:
+        try:
+            data = json.loads(blob)
+            stance = str(data.get("ai_stance") or "").strip().lower().replace("-", "_")
+            if stance == "exit early":
+                stance = "exit_early"
+            if stance == "wait for entry" or stance == "wait":
+                stance = "wait_entry"
+            if stance in _AI_STANCES:
+                out["ai_stance"] = stance
+            reason = data.get("reasoning") or data.get("reason") or data.get("summary")
+            if isinstance(reason, str) and reason.strip():
+                out["ai_stance_reason"] = reason.strip()[:400]
+                # Prefer structured reasoning as the display blurb when present.
+                prose = re.sub(r"```json\s*\{.*?\}\s*```", "", raw, flags=re.S | re.I).strip()
+                out["ai_reasoning"] = (prose or reason.strip())[:1200]
+        except Exception:  # noqa: BLE001
+            pass
+    if out["ai_stance"] is None:
+        m3 = re.search(
+            r"\b(?:ai[_\s-]?stance|stance)\s*[:=]\s*(hold|caution|exit_early|wait_entry|exit\s+early|wait)\b",
+            raw,
+            re.I,
+        )
+        if m3:
+            s = m3.group(1).lower().replace(" ", "_").replace("-", "_")
+            if s == "wait":
+                s = "wait_entry"
+            if s in _AI_STANCES:
+                out["ai_stance"] = s
+    return out
 
 
 def build_chat_prompt(

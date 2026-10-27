@@ -136,12 +136,66 @@ def test_journal_ties_keep_insertion_order(path, monkeypatch):
 
 LEVELS = {"bias": "Buy", "entry": 100, "stop_loss": 95, "take_profit": 110, "confidence": 0.7,
           "reasoning": "why"}
-MARKET = {"setup": {"type": "pullback", "trade_allowed": True}, "confluence": {"score": 3.0}}
+MARKET = {
+    "setup": {"type": "pullback", "trade_allowed": True},
+    "confluence": {"score": 3.0},
+    "coin_analysis": {
+        "price_data": {"current_price": 100.5},
+        "support_resistance": {"nearest_support": 98.0, "nearest_resistance": 105.0},
+        "fibonacci": {
+            "available": True,
+            "levels": {"0.5": 101.0, "0.618": 99.5},
+            "swing_high": 110.0,
+            "swing_low": 90.0,
+        },
+        "market_structure": {"trend": "Bullish", "trend_line": 97.0},
+    },
+    "flow": {"available": True, "whale_bias": "Long", "whale_long_pct": 55.0, "summary": "Whales long"},
+    "liquidity": {"available": True, "bias": "Neutral", "long_share_pct": 50.0, "short_share_pct": 50.0},
+    "orderbook": {"available": True, "bias": "Bid", "imbalance": 0.1},
+}
+
+
+def test_build_decision_levels_includes_plan_sr_fib():
+    levels = signals.build_decision_levels(LEVELS, MARKET)
+    kinds = {row["kind"] for row in levels}
+    assert {"entry", "stop", "target", "support", "resistance", "fib", "trend"} <= kinds
+    by_kind = {row["kind"]: row["price"] for row in levels if row["kind"] in ("entry", "stop", "target")}
+    assert by_kind["entry"] == 100.0 and by_kind["stop"] == 95.0 and by_kind["target"] == 110.0
+
+
+def test_record_signal_archives_market_context(path):
+    sig = signals.record_signal(symbol="btcusdt", timeframe="1h", levels=LEVELS, market=MARKET)
+    ctx = sig.get("market_context_json")
+    assert isinstance(ctx, dict)
+    assert isinstance(ctx.get("decision_levels"), list) and len(ctx["decision_levels"]) >= 3
+    assert (ctx.get("whales") or {}).get("available") is True or (ctx.get("whales") or {}).get("whale_bias")
+    loaded = signals.get_signal(sig["id"])
+    assert loaded and isinstance(loaded.get("market_context_json"), dict)
+    assert loaded["market_context_json"].get("decision_levels")
 
 
 def test_record_signal_round_trip(path):
-    assert signals.record_signal(symbol="btcusdt", timeframe="4h", levels={"bias": "Neutral"}) is None
+    # Incomplete Buy is still skipped; Neutral archives separately (WL-080).
     assert signals.record_signal(symbol="btcusdt", timeframe="4h", levels={"bias": "Buy", "entry": 1}) is None
+    neut = signals.record_signal(
+        symbol="solusdt",
+        timeframe="1h",
+        levels={"bias": "Neutral", "confidence": 0.4, "reasoning": "chop"},
+        market=MARKET,
+    )
+    assert neut is not None
+    assert neut["status"] == "neutral" and neut["bias"] == "Neutral"
+    assert neut["entry"] is None and neut["stop_loss"] is None
+    assert signals.list_signals(kind="trades") == []
+    assert [r["id"] for r in signals.list_signals(kind="neutral")] == [neut["id"]]
+    again_n = signals.record_signal(
+        symbol="SOLUSDT",
+        timeframe="1h",
+        levels={"bias": "Neutral", "reasoning": "chop again"},
+        market=MARKET,
+    )
+    assert again_n == neut
 
     sig = signals.record_signal(symbol="btcusdt", timeframe="4h", levels=LEVELS, market=MARKET)
     assert len(sig["id"]) == 8
@@ -160,9 +214,30 @@ def test_record_signal_round_trip(path):
     assert listed[1] == sig and list(listed[1]) == list(sig)
     assert signals.list_signals(symbol="ETHUSDT") == [other]  # .P stripped on both sides
     assert signals.list_signals(limit=1) == [other]
+    assert neut["id"] not in {r["id"] for r in listed}
 
     st = signals.signal_stats()
     assert st["total"] == 2 and st["open"] == 2 and st["hit_rate"] is None
+    assert st.get("neutral") == 1  # global stats still report Neutral count apart from trades
+    all_stats = signals.signal_stats(signals.list_signals(kind="all", limit=100))
+    assert all_stats["total"] == 2 and all_stats["neutral"] == 1
+    trade_only = signals.signal_stats(signals.list_signals(kind="trades", limit=100))
+    assert trade_only["total"] == 2 and trade_only.get("neutral") == 0
+
+
+def test_delete_signal_removes_row(path):
+    sig = signals.record_signal(symbol="btcusdt", timeframe="1h", levels=LEVELS, market=MARKET)
+    sig["live_review_json"] = [{"at": "x", "price": 101}]
+    from app.db import SIGNAL_COLUMNS, connect, update_row
+
+    with connect() as conn:
+        update_row(conn, "signals", SIGNAL_COLUMNS, sig)
+    assert signals.get_signal(sig["id"]) is not None
+    assert signals.delete_signal(sig["id"]) is True
+    assert signals.get_signal(sig["id"]) is None
+    assert signals.delete_signal(sig["id"]) is False
+    assert signals.delete_signal("") is False
+    assert signals.list_signals() == []
 
 
 def test_verify_writes_back(path, monkeypatch):
@@ -204,6 +279,7 @@ def _old_signal(sid, minutes_ago=0):
         "strategy_id": None,
         "live_review_json": [],
         "multi_analysis_json": None,
+        "market_context_json": None,
     }
 
 

@@ -28,9 +28,10 @@ Its visual language is adapted from the **Unefy portal design system** (Portal D
 | Page | Route | Contents |
 |---|---|---|
 | Desk | `#/desk` | Chart, structure levels, KPI strip, four insight cards, Analyst chat |
+| Hot | `#/hot` | Volatility scan by Majors / Mid / Alts, optional AI brief, Open on Desk ([feature](features/hot.md)) |
 | Watchlist | `#/watchlist` | KPI strip + scored table ([feature](features/watchlist.md)) |
 | Journal | `#/journal` | KPI strip + trades with Win / Loss / BE / Skip / Delete ([feature](features/journal.md)) |
-| Signals | `#/signals` | KPI strip + archived signals with Check / Verify ([feature](features/signals.md)) |
+| Signals | `#/signals`, `#/signals/{id}` | KPI strip + archived signals; detail shows archived whales/liquidity/structure and auto-drawn decision chart (WL-077) ([feature](features/signals.md)) |
 
 The rail at 224px folds to 64px icons with the toggle at its foot (« / »). Below 900px it turns into a slide-in drawer opened by ☰. The AI provider chip at the bottom shows the active provider and model; the dot is green when a key is configured and amber when it isn't.
 

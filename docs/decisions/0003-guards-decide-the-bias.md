@@ -1,6 +1,6 @@
 # 0003: Deterministic guards decide the bias, not the AI
 
-**Date:** recorded 2026-10-21 (the confluence guard predates this repo's history; the reward:risk guard is WL-007) · **Status:** accepted; the Neutral upgrade is under review in WL-021
+**Date:** recorded 2026-10-21 (the confluence guard predates this repo's history; the reward:risk guard is WL-007) · **Status:** accepted (default path); optional opt-out via `guard_mode=ai_only` in [0009](0009-guard-mode-choice.md); the Neutral upgrade is under review in WL-021
 
 ## Context
 

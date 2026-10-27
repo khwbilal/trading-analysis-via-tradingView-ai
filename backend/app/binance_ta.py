@@ -86,6 +86,30 @@ def _atr(highs: list[float], lows: list[float], closes: list[float], period: int
     return atr
 
 
+def fetch_live_last_price(pair: str) -> float | None:
+    """Fresh last trade price (futures first, then spot). Used to invalidate stale plans (WL-081)."""
+    sym = pair.upper().replace(".P", "").replace("/", "")
+    urls = [
+        f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}",
+        f"https://api.binance.com/api/v3/ticker/price?symbol={sym}",
+    ]
+    with httpx.Client(timeout=8.0) as client:
+        for url in urls:
+            try:
+                r = client.get(url)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                px = data.get("price") if isinstance(data, dict) else None
+                if px is not None:
+                    val = float(px)
+                    if val > 0:
+                        return val
+            except Exception:  # noqa: BLE001
+                continue
+    return None
+
+
 def _fetch_klines(pair: str, interval: str, limit: int = 220) -> list[list[Any]]:
     urls = [
         f"https://api.binance.com/api/v3/klines?symbol={pair}&interval={interval}&limit={limit}",
@@ -113,35 +137,60 @@ def build_suggested_levels(
     recent_high: float,
     recent_low: float,
     atr: float | None,
-    stop_atr_min: float = 0.75,
-    stop_atr_max: float = 2.0,
+    stop_atr_min: float = 1.0,
+    stop_atr_max: float = 2.5,
     target_r_min: float = 2.0,
+    stop_buffer_atr: float = 0.25,
+    entry_style: str = "market",
+    entry_offset_atr: float = 0.35,
 ) -> dict[str, Any]:
-    """Structural entry/stop/target with strategy ATR stop bands (WL-053).
+    """Structural entry/stop/target with strategy ATR bands and entry style (WL-064).
 
-    The stop sits beyond the swing but within stop_atr_min..stop_atr_max of entry.
-    The target is the far side of the swing, pushed out to at least target_r_min R.
+    Stops sit beyond the swing within stop_atr_min..max, then add stop_buffer_atr.
+    Entry: market = print; limit/reclaim = wait into value (not always the analysis print).
+    Target is the far swing side, pushed out to at least target_r_min R from entry.
     """
     lo = min(float(stop_atr_min), float(stop_atr_max))
     hi = max(float(stop_atr_min), float(stop_atr_max))
     unit = atr or price * 0.01
+    buf = max(0.0, float(stop_buffer_atr)) * unit
+    offset = max(0.0, float(entry_offset_atr)) * unit
     swing_pad = unit * 0.35
-    entry = round(price, 6)
+    style = (entry_style or "market").strip().lower()
+    if style not in ("market", "limit", "reclaim"):
+        style = "market"
+
     if trend == "Bullish":
-        risk = min(max(price - (recent_low - swing_pad), unit * lo), unit * hi)
-        stop = round(price - risk, 6)
-        target = round(max(recent_high + swing_pad, price + target_r_min * risk), 6)
         bias_hint = "Buy"
+        if style == "market":
+            entry = round(price, 6)
+        else:
+            # Limit/reclaim into discount: nearer support, not extended print.
+            zone = min(price, float(recent_low) + offset + swing_pad)
+            entry = round(min(price, max(zone, price - offset)), 6)
+        raw_stop = min(entry, float(recent_low)) - swing_pad - buf
+        risk = min(max(entry - raw_stop, unit * lo), unit * hi)
+        stop = round(entry - risk, 6)
+        target = round(max(float(recent_high) + swing_pad, entry + target_r_min * risk), 6)
     elif trend == "Bearish":
-        risk = min(max((recent_high + swing_pad) - price, unit * lo), unit * hi)
-        stop = round(price + risk, 6)
-        target = round(min(recent_low - swing_pad, price - target_r_min * risk), 6)
         bias_hint = "Sell"
+        if style == "market":
+            entry = round(price, 6)
+        else:
+            zone = max(price, float(recent_high) - offset - swing_pad)
+            entry = round(max(price, min(zone, price + offset)), 6)
+        raw_stop = max(entry, float(recent_high)) + swing_pad + buf
+        risk = min(max(raw_stop - entry, unit * lo), unit * hi)
+        stop = round(entry + risk, 6)
+        target = round(min(float(recent_low) - swing_pad, entry - target_r_min * risk), 6)
     else:
-        mid = (lo + hi) / 2
-        stop = round(price - unit * mid, 6)
-        target = round(price + unit * mid * max(target_r_min, 1.0), 6)
         bias_hint = "Neutral"
+        entry = round(price, 6)
+        mid = (lo + hi) / 2
+        stop = round(price - unit * mid - buf, 6)
+        risk = abs(entry - stop) or unit * mid
+        target = round(price + risk * max(target_r_min, 1.0), 6)
+
     return {
         "bias_hint": bias_hint,
         "entry": entry,
@@ -149,7 +198,10 @@ def build_suggested_levels(
         "take_profit": target,
         "stop_atr_min": lo,
         "stop_atr_max": hi,
+        "stop_buffer_atr": float(stop_buffer_atr),
         "target_r_min": float(target_r_min),
+        "entry_style": style,
+        "entry_offset_atr": float(entry_offset_atr),
     }
 
 
@@ -159,6 +211,9 @@ def apply_strategy_risk_to_analysis(
     stop_atr_min: float,
     stop_atr_max: float,
     target_r_min: float,
+    stop_buffer_atr: float = 0.25,
+    entry_style: str = "market",
+    entry_offset_atr: float = 0.35,
 ) -> dict[str, Any]:
     """Rebuild suggested_levels on an existing local/TV analysis using strategy bands."""
     if not isinstance(analysis, dict):
@@ -187,6 +242,9 @@ def apply_strategy_risk_to_analysis(
         stop_atr_min=stop_atr_min,
         stop_atr_max=stop_atr_max,
         target_r_min=target_r_min,
+        stop_buffer_atr=stop_buffer_atr,
+        entry_style=entry_style,
+        entry_offset_atr=entry_offset_atr,
     )
     merged = dict(sug)
     merged.update(
@@ -197,7 +255,10 @@ def apply_strategy_risk_to_analysis(
             "take_profit": levels["take_profit"],
             "stop_atr_min": levels["stop_atr_min"],
             "stop_atr_max": levels["stop_atr_max"],
+            "stop_buffer_atr": levels["stop_buffer_atr"],
             "target_r_min": levels["target_r_min"],
+            "entry_style": levels["entry_style"],
+            "entry_offset_atr": levels["entry_offset_atr"],
         }
     )
     # Keep structural S/R fields that were already present.
@@ -214,12 +275,16 @@ def compute_local_analysis(
     pair: str,
     timeframe: str,
     *,
-    stop_atr_min: float = 0.75,
-    stop_atr_max: float = 2.0,
+    stop_atr_min: float = 1.0,
+    stop_atr_max: float = 2.5,
     target_r_min: float = 2.0,
+    stop_buffer_atr: float = 0.25,
+    entry_style: str = "market",
+    entry_offset_atr: float = 0.35,
 ) -> dict[str, Any]:
     interval = normalize_timeframe(timeframe)
     raw = _fetch_klines(pair.upper(), interval)
+    open_times = [int(x[0]) for x in raw]
     opens = [float(x[1]) for x in raw]
     highs = [float(x[2]) for x in raw]
     lows = [float(x[3]) for x in raw]
@@ -289,6 +354,9 @@ def compute_local_analysis(
         stop_atr_min=stop_atr_min,
         stop_atr_max=stop_atr_max,
         target_r_min=target_r_min,
+        stop_buffer_atr=stop_buffer_atr,
+        entry_style=entry_style,
+        entry_offset_atr=entry_offset_atr,
     )
     bias_hint = levels["bias_hint"]
     entry = levels["entry"]
@@ -352,7 +420,10 @@ def compute_local_analysis(
             "take_profit": target,
             "stop_atr_min": levels["stop_atr_min"],
             "stop_atr_max": levels["stop_atr_max"],
+            "stop_buffer_atr": levels["stop_buffer_atr"],
             "target_r_min": levels["target_r_min"],
+            "entry_style": levels["entry_style"],
+            "entry_offset_atr": levels["entry_offset_atr"],
             "support": round(recent_low, 6),
             "resistance": round(recent_high, 6),
             "support_2": round(e50, 6) if e50 else None,
@@ -372,7 +443,7 @@ def compute_local_analysis(
             "average_20": round(sum(volumes[-20:]) / min(20, len(volumes)), 4),
         },
     }
-    out.update(_structure_overlays(highs, lows, closes, atr))
+    out.update(_structure_overlays(highs, lows, closes, atr, open_times))
     return out
 
 
@@ -550,11 +621,160 @@ def _fibonacci(
     }
 
 
+def _utc_day_hour(ms: int) -> tuple[int, int]:
+    """UTC day index and hour from a Binance open time in milliseconds."""
+    sec = int(ms) // 1000
+    return sec // 86400, (sec % 86400) // 3600
+
+
+def _fair_value_gaps(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+) -> dict[str, Any]:
+    """Unfilled 3-candle imbalances. Bullish: low[i] > high[i-2]. Bearish: high[i] < low[i-2]."""
+    if len(closes) < 3:
+        return {"available": False, "unfilled": [], "nearest": None}
+    gaps: list[dict[str, Any]] = []
+    start = max(2, len(closes) - 60)
+    for i in range(start, len(closes)):
+        if lows[i] > highs[i - 2]:
+            top, bot = lows[i], highs[i - 2]
+            filled = any(lows[j] <= bot for j in range(i + 1, len(closes)))
+            if not filled:
+                gaps.append(
+                    {
+                        "side": "bullish",
+                        "top": round(top, 6),
+                        "bottom": round(bot, 6),
+                        "index": i,
+                    }
+                )
+        if highs[i] < lows[i - 2]:
+            top, bot = lows[i - 2], highs[i]
+            filled = any(highs[j] >= top for j in range(i + 1, len(closes)))
+            if not filled:
+                gaps.append(
+                    {
+                        "side": "bearish",
+                        "top": round(top, 6),
+                        "bottom": round(bot, 6),
+                        "index": i,
+                    }
+                )
+    price = closes[-1]
+
+    def _dist(gap: dict[str, Any]) -> float:
+        if gap["bottom"] <= price <= gap["top"]:
+            return 0.0
+        return min(abs(price - gap["top"]), abs(price - gap["bottom"]))
+
+    gaps.sort(key=_dist)
+    return {
+        "available": bool(gaps),
+        "unfilled": gaps[:3],
+        "nearest": gaps[0] if gaps else None,
+        "price": round(price, 6),
+    }
+
+
+def _session_box(
+    open_times: list[int],
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+) -> dict[str, Any]:
+    """Completed Asia session (00:00 to 08:00 UTC) high and low versus the last close."""
+    if not open_times or len(open_times) != len(closes) or not closes:
+        return {"available": False, "reason": "no timestamps"}
+    day, hour = _utc_day_hour(open_times[-1])
+    target = day if hour >= 8 else day - 1
+    asia_highs: list[float] = []
+    asia_lows: list[float] = []
+    for ts, high, low in zip(open_times, highs, lows, strict=True):
+        bar_day, bar_hour = _utc_day_hour(ts)
+        if bar_day == target and bar_hour < 8:
+            asia_highs.append(high)
+            asia_lows.append(low)
+    if len(asia_highs) < 4:
+        return {
+            "available": False,
+            "reason": "asia session incomplete",
+            "asia_bars": len(asia_highs),
+        }
+    box_high = max(asia_highs)
+    box_low = min(asia_lows)
+    price = closes[-1]
+    if price > box_high:
+        location = "above"
+    elif price < box_low:
+        location = "below"
+    else:
+        location = "inside"
+    if hour < 8:
+        window = "asia"
+    elif hour < 13:
+        window = "london"
+    elif hour < 21:
+        window = "new_york"
+    else:
+        window = "late"
+    return {
+        "available": True,
+        "asia_high": round(box_high, 6),
+        "asia_low": round(box_low, 6),
+        "location": location,
+        "window": window,
+        "asia_bars": len(asia_highs),
+        "price": round(price, 6),
+    }
+
+
+def _day_levels(
+    open_times: list[int],
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+) -> dict[str, Any]:
+    """Prior UTC day high/low and whether the last candle rejected them."""
+    if not open_times or len(open_times) != len(closes) or not closes:
+        return {"available": False, "reason": "no timestamps"}
+    day, _hour = _utc_day_hour(open_times[-1])
+    today_highs: list[float] = []
+    today_lows: list[float] = []
+    prior_highs: list[float] = []
+    prior_lows: list[float] = []
+    for ts, high, low in zip(open_times, highs, lows, strict=True):
+        bar_day, _bar_hour = _utc_day_hour(ts)
+        if bar_day == day:
+            today_highs.append(high)
+            today_lows.append(low)
+        elif bar_day == day - 1:
+            prior_highs.append(high)
+            prior_lows.append(low)
+    if not prior_highs:
+        return {"available": False, "reason": "no prior utc day"}
+    pdh = max(prior_highs)
+    pdl = min(prior_lows)
+    price = closes[-1]
+    return {
+        "available": True,
+        "prior_day_high": round(pdh, 6),
+        "prior_day_low": round(pdl, 6),
+        "today_high": round(max(today_highs), 6) if today_highs else None,
+        "today_low": round(min(today_lows), 6) if today_lows else None,
+        "reject_prior_high": highs[-1] >= pdh and price < pdh,
+        "reject_prior_low": lows[-1] <= pdl and price > pdl,
+        "price": round(price, 6),
+    }
+
+
 def _structure_overlays(
     highs: list[float],
     lows: list[float],
     closes: list[float],
     atr: float | None,
+    open_times: list[int] | None = None,
 ) -> dict[str, Any]:
     sh, sl = _pivot_swings(highs, lows)
     eq_h = _equal_levels(sh)
@@ -571,6 +791,7 @@ def _structure_overlays(
         "position": bb.get("position"),
         "atr": round(atr, 6) if atr else None,
     }
+    times = open_times or []
     return {
         "swings": {
             "highs": sh[-8:],
@@ -582,6 +803,9 @@ def _structure_overlays(
         "structure": structure,
         "fibonacci": fib,
         "squeeze": squeeze,
+        "fair_value_gaps": _fair_value_gaps(highs, lows, closes),
+        "session_box": _session_box(times, highs, lows, closes),
+        "day_levels": _day_levels(times, highs, lows, closes),
     }
 
 

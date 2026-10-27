@@ -7,20 +7,24 @@ import { FeedbackProvider } from "./components/feedback";
 import { Rail, TopBar } from "./components/Shell";
 import { PAGES, TIMEFRAMES, type PageKey } from "./lib/nav";
 import { readPref, readRecents, rememberRecent, writePref } from "./lib/storage";
+import BacktestDetail from "./pages/BacktestDetail";
+import Backtests from "./pages/Backtests";
 import CalendarPage from "./pages/Calendar";
 import Dashboard from "./pages/Dashboard";
 import Desk from "./pages/Desk";
+import Hot from "./pages/Hot";
 import Journal from "./pages/Journal";
 import SignalDetail from "./pages/SignalDetail";
 import Signals from "./pages/Signals";
 import Watchlist from "./pages/Watchlist";
 
-function parseHash(): { page: PageKey; signalId: string | null } {
+function parseHash(): { page: PageKey; signalId: string | null; backtestRunId: string | null } {
   const parts = window.location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   const name = parts[0] ?? "desk";
   const page = name in PAGES ? (name as PageKey) : "desk";
   const signalId = page === "signals" && parts[1] ? parts[1] : null;
-  return { page, signalId };
+  const backtestRunId = page === "backtests" && parts[1] ? parts[1] : null;
+  return { page, signalId, backtestRunId };
 }
 
 function initialTimeframe(): string {
@@ -33,6 +37,7 @@ export default function App() {
   const initialHash = parseHash();
   const [page, setPage] = useState<PageKey>(initialHash.page);
   const [signalId, setSignalId] = useState<string | null>(initialHash.signalId);
+  const [backtestRunId, setBacktestRunId] = useState<string | null>(initialHash.backtestRunId);
   const [symbol, setSymbol] = useState(recent?.symbol ?? "SOLUSDT");
   const [exchange, setExchange] = useState(recent?.exchange ?? "BINANCE");
   const [tvSymbol, setTvSymbol] = useState(recent?.tv_symbol ?? "BINANCE:SOLUSDT");
@@ -55,6 +60,7 @@ export default function App() {
       const h = parseHash();
       setPage(h.page);
       setSignalId(h.signalId);
+      setBacktestRunId(h.backtestRunId);
       setNavOpen(false);
     };
     window.addEventListener("hashchange", onHash);
@@ -88,6 +94,10 @@ export default function App() {
 
   const goToSignal = (id: string) => {
     window.location.hash = `#/signals/${encodeURIComponent(id)}`;
+  };
+
+  const goToBacktestRun = (id: string) => {
+    window.location.hash = `#/backtests/${encodeURIComponent(id)}`;
   };
 
   const openOnDesk = (s: string, ex?: string, tv?: string) => {
@@ -149,6 +159,19 @@ export default function App() {
             <Box hidden={page !== "dashboard"}>
               <Dashboard active={page === "dashboard"} version={signalsVersion} />
             </Box>
+            <Box hidden={page !== "backtests"}>
+              {backtestRunId ? (
+                <BacktestDetail runId={backtestRunId} onBack={() => goTo("backtests")} />
+              ) : (
+                <Backtests
+                  active={page === "backtests" && !backtestRunId}
+                  onOpenRun={goToBacktestRun}
+                />
+              )}
+            </Box>
+            <Box hidden={page !== "hot"}>
+              <Hot onOpen={(s) => openOnDesk(s, "BINANCE")} />
+            </Box>
             <Box hidden={page !== "watchlist"}>
               <Watchlist timeframe={timeframe} onOpen={(s) => openOnDesk(s, "BINANCE")} />
             </Box>
@@ -164,6 +187,7 @@ export default function App() {
                   signalId={signalId}
                   onBack={() => goTo("signals")}
                   onReviewed={() => setSignalsVersion((v) => v + 1)}
+                  onDeleted={() => setSignalsVersion((v) => v + 1)}
                 />
               ) : (
                 <Signals

@@ -29,10 +29,12 @@ import ChevronRight from "@mui/icons-material/ChevronRight";
 import DarkModeOutlined from "@mui/icons-material/DarkModeOutlined";
 import FormatListBulleted from "@mui/icons-material/FormatListBulleted";
 import LightModeOutlined from "@mui/icons-material/LightModeOutlined";
+import LocalFireDepartmentOutlined from "@mui/icons-material/LocalFireDepartmentOutlined";
 import MenuBookOutlined from "@mui/icons-material/MenuBookOutlined";
 import MenuIcon from "@mui/icons-material/Menu";
 import Search from "@mui/icons-material/Search";
 import SettingsBrightnessOutlined from "@mui/icons-material/SettingsBrightnessOutlined";
+import ScienceOutlined from "@mui/icons-material/ScienceOutlined";
 import ShowChart from "@mui/icons-material/ShowChart";
 import TrackChanges from "@mui/icons-material/TrackChanges";
 import { useEffect, useRef, useState, type ReactElement } from "react";
@@ -46,6 +48,8 @@ import { monoSx } from "./ui";
 const NAV_ICON: Record<PageKey, ReactElement> = {
   desk: <CandlestickChartOutlined />,
   dashboard: <ShowChart />,
+  backtests: <ScienceOutlined />,
+  hot: <LocalFireDepartmentOutlined />,
   watchlist: <FormatListBulleted />,
   calendar: <CalendarMonthOutlined />,
   journal: <MenuBookOutlined />,
@@ -194,6 +198,8 @@ function RailContent({
       <List dense sx={{ flex: 1, overflowY: "auto", pt: 1 }}>
         <NavItem page="desk" current={page} folded={folded} />
         <NavItem page="dashboard" current={page} folded={folded} />
+        <NavItem page="backtests" current={page} folded={folded} />
+        <NavItem page="hot" current={page} folded={folded} />
         <NavItem page="watchlist" current={page} folded={folded} />
         <NavItem page="calendar" current={page} folded={folded} />
         {folded ? (
