@@ -1,0 +1,20 @@
+# Keep secrets, data and local builds out of the image (WL-087).
+**/.env
+**/.env.*
+!**/.env.example
+.git
+.claude
+.mcp.json
+backend/.venv
+backend/data
+backend/**/__pycache__
+backend/.pytest_cache
+backend/.ruff_cache
+frontend/node_modules
+frontend/dist
+frontend/.vite
+backups
+share
+*.log
+*.db
+private

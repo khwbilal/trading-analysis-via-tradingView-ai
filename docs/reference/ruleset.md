@@ -1,0 +1,168 @@
+# Ruleset: Crypto Chart AI development
+
+Version 1.6, 2026-10-24. Owner: Sheryar. Scope: all work on this repo (FastAPI backend in `backend/`, the React + MUI portal in `frontend/`, `docs/`). Adapted from the unefy-platform FE ruleset v2.0 (`C:\IT22\unefy-platform\instructions\ruleset-fe-development.md`); see [decision 0006](../decisions/0006-unefy-way-of-working.md) for what was kept, changed and left out. Sits on top of `CLAUDE.md` and `docs/`; where it is silent they win, and a verified repo fact beats this file.
+
+## 0. Tailoring and self-review
+
+0.1 Sheryar may change this ruleset at any time in plain words. The LLM shows the exact diff, waits for an ok, then applies it and bumps the version and change log. Nothing is edited silently.
+
+0.2 Every 10th prompt the LLM reviews itself (where did Sheryar repeat or correct himself; what was wrong or unverified) and shows a short finding list, a proposed diff and one request. It applies nothing before he answers. Nothing to fix: one line, reset the count.
+
+0.3 Sections are Required, Conditional (only when the change touches that area) or Not required. When unsure, ask once.
+
+0.4 Precedence: Sheryar's current message, then this file, then defaults. Repo facts beat memory and this file.
+
+## 1. Work items (Required)
+
+Tracker of record: [docs/work-log.md](../work-log.md), ids `WL-nnn`.
+
+1.1 Every unit of work gets a work-log entry (id, title, context, acceptance criteria) **before the first code edit**. Take the next free id from the log. Scan for duplicates first.
+
+1.2 One item, one change set. While the repo has no git (2026-10-21, section 4) there are no branches; an item is done when its gate is green and its docs pass is written.
+
+1.3 Status is open / in progress / blocked / done; a done item keeps its row with the outcome. Never invent hours or dates.
+
+1.4 Create items immediately when work is found (a bump, a CVE, a review gap, a follow-up), in the same turn. Ask about what to *do*, never about whether to *log*.
+
+## 2. Sub agents and context budget (Required)
+
+2.1 The main chat does every item itself; no sub agents (Sheryar, 2026-10-22, to save tokens). The `wl-worker` definition stays for reference only.
+
+2.2 (removed in 1.3)
+
+2.3 Back up any file before a risky or scripted edit (no git, section 4).
+
+2.4 (removed in 1.3)
+
+2.5 **Docs come last, once:** when the items of a batch are done, the main chat runs one documentation pass (work-log outcomes, feature docs, hubs, decisions, incidents, [project-state.md](../project-state.md)).
+
+2.6 Keep the token load small: `CLAUDE.md`, `MEMORY.md` and the agent definition stay lean, detail goes to `docs/`. Ask Sheryar for the `/context` base load at session start (target under 10K). MCP servers stay off unless a task needs them. Agents keep command output short (`tail`, `Select-Object -Last N`).
+
+## 3. Documentation (Required, written in the docs pass of 2.5)
+
+- A feature added or substantially changed: its page in `docs/features/` (or a new one) with a file map, the why, the API contract, gotchas and an extension checklist, linked from [docs/README.md](../README.md).
+- A non-obvious choice: `docs/decisions/NNNN-*.md`, listed in [Decisions](../decisions/Decisions.md); supersede with a new note, never rewrite an old one.
+- A non-obvious failure: `docs/incidents/WL-nnn.md` from the [template](../incidents/_TEMPLATE.md), listed in the [incidents README](../incidents/README.md). An item with nothing surprising says "no incidents" in its work-log entry.
+- Every new doc is linked from its hub with a standard markdown link (no wiki links).
+- Record every limitation or known issue noticed, with date and status, even outside the task.
+- [project-state.md](../project-state.md) is updated at the end of every session.
+- Memory: only what the repo does not already record, one fact per file.
+- If Sheryar edits code, update the affected docs and say which.
+- Project text (docs, memory, commit messages once git exists): **no em dashes, no en dashes, no exclamation marks.** Older docs still contain dashes; [WL-020](../work-log.md) sweeps them.
+
+## 4. Git (Not required, dormant)
+
+4.1 Sheryar decided on 2026-10-21 to **leave git out for now** ([decision 0004](../decisions/0004-no-git-for-now.md)). Do not initialise git or suggest it.
+
+4.2 Because nothing can be reverted: back up a file before a risky or scripted edit, and record changed files in the item's work-log entry.
+
+4.3 If Sheryar enables git later, adopt the unefy rules: Conventional Commits with the `WL-nnn` id, one branch per item, commit or push only when asked, never `--no-verify`. Then update this section and the version.
+
+## 5. Errors (Required)
+
+One failing check, build or bug is one item: capture the real output and exit code (write to a file, never trust a piped `echo $?`), log it, ask before an agent (2.2), fix, add a check.
+
+## 6. Quality gate (Required)
+
+6.1 Done means every applicable step exits 0. Write output to a file and read the real code: `cmd > out.txt 2>&1; echo "REAL EXIT: $?"`.
+
+| Step | Command (from the repo root) | When |
+|---|---|---|
+| Python compiles | `backend/.venv/Scripts/python.exe -m compileall -q backend/app` | any backend change |
+| Python tests | `cd backend && .venv/Scripts/python.exe -m pytest -q` | any backend change |
+| Python lint | `cd backend && .venv/Scripts/python.exe -m ruff check app tests` | any backend change |
+| React lint | `cd frontend && npx eslint .` | any React change |
+| React types and build | `cd frontend && npx tsc -b && npm run build` (keep `frontend/dist`: FastAPI serves it) | any React change |
+| Smoke test | start uvicorn on a spare port with `AI_PROVIDER=none`, then `GET /api/health` is 200 and `POST /api/analyze` returns `provider: "offline"` | any backend change |
+| UI check | Playwright from `C:/IT22/unefy-platform/node_modules/playwright`: desktop and 390px phone, light and dark, no page errors, no horizontal overflow | visible UI changes |
+| Security scan | see 7.2 | dependency changes, before declaring a batch done |
+
+6.2 Tests and lint are described in [testing-and-lint.md](../testing-and-lint.md). A change to a tested unit updates its test in the same item.
+
+6.3 **Never call a billable AI in a check.** `AI_PROVIDER=claude_code` spends Sheryar's plan usage and `claude` / `cursor` / `openai` spend money: use them only when the item is about AI output, say so before the call, and keep it to one request.
+
+6.4 Report real results; never mark an item done while a step is red. Never weaken or delete a check without asking.
+
+## 7. Security and versions (Required)
+
+7.1 No secrets or personal data in logs, fixtures, errors, docs or memory. Never print or copy the values in `backend/.env`; refer to keys by name. Keep the server on `127.0.0.1` (the API has no auth). The `claude_code` provider is for Sheryar's personal local use only.
+
+7.2 Security scan (Trivy is installed via winget):
+
+```bash
+trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --ignore-unfixed \
+  --skip-dirs backend/.venv --skip-dirs frontend/node_modules --skip-dirs frontend/dist \
+  --exit-code 1 . > trivy.txt 2>&1; echo "REAL EXIT: $?"
+```
+
+It fails only on **fixable** High/Critical findings; do not lower that. A fixable CVE becomes its own work item and bump, never folded into an unrelated change. An accepted finding goes in a `.trivyignore` with a reason on the line, never a bare waiver.
+
+7.3 On "hi claude", check versions: `uv pip list --outdated` (in `backend/`), `npm outdated` and `npm audit` (in `frontend/`), the Trivy scan, and the toolchain (`node -v` is 24.x LTS, `uv --version`, `uv self update --dry-run`, `trivy --version`, `claude --version` and `claude auth status`). Report current to latest. Patch and minor bumps inside the current major are logged and done without asking; majors are asked first with what they break. Transitive Python packages move with their parent (`uv lock --upgrade-package <parent>`), not pinned directly. Machine-level tools needing winget or admin rights are listed for Sheryar to run.
+
+## 8. API contracts (Conditional)
+
+When an endpoint is added or its shape changes: update [api-reference.md](../api-reference.md), the schema in `backend/app/schemas.py`, and the types in `frontend/src/api.ts` in the same item, and check both UIs read the new shape.
+
+## 9. Front end standards (Required for UI work)
+
+9.1 One UI: the React portal in `frontend/`, built with MUI. The built-in UI in `backend/app/static/` is retired by WL-047 ([decision 0008](../decisions/0008-react-mui-only.md)); FastAPI serves the React build. Until WL-047 is done, the built-in UI is frozen: fixes only, no new features.
+
+9.2 One theme: `frontend/src/theme.ts` (MUI `createTheme`, light and dark) holds every colour. Components use theme values, never hex. Discuss before changing the palette.
+
+9.3 Conventions from [ui.md](../ui.md): direction ink (green/red) for Buy/Sell, win/loss and a price change up/down (WL-152) only, every pill has a glyph; missing data is an em dash with a reason (`na()` / `<Na>`); model output is never rendered as raw HTML (React escapes by default; no `dangerouslySetInnerHTML` on it); an MUI Dialog through one shared confirm helper instead of `prompt` / `confirm`; one primary button per view; mobile body text 16px and 48px targets.
+
+9.4 The design reference is the Unefy portal (`C:\IT22\unefy-platform`, Portal Design Guide v2.x). Port from real measurements; say when something was measured from a screenshot.
+
+## 10. Working style (Required)
+
+10.1 One step or question per message, placed last. Batch independent low-risk tool calls.
+
+10.2 Announce large tree changes (moves, renames, new top-level folders) and get approval first; update every path reference after a move.
+
+10.3 Report faithfully: failures with output, skipped steps named, done stated plainly.
+
+10.4 **"hi claude"** starts the session: confirm this ruleset, start the prompt count, read [project-state.md](../project-state.md), then report in a few lines: the docs review (open work-log items and "to fill in" lines, hub coverage, every feature doc's file map naming files that still exist), the version and security check (7.3) and the machine check (Node 24, uv, Trivy, Claude CLI login). List gaps and log items for them; fix nothing yet.
+
+10.5 At handover: update [project-state.md](../project-state.md), and say which items are open and which files changed.
+
+10.6 After a scripted edit, grep for the result. Prefer the Edit tool; for large scripted edits write a `.js` file to the scratchpad and run it (long heredocs with backticks break the Bash tool).
+
+10.7 Windows traps (details in [project-state.md](../project-state.md#gotchas-learned-the-hard-way-windows)): Vite serves on `localhost` (IPv6) not `127.0.0.1`; set `PYTHONIOENCODING=utf-8` for ad-hoc Python output; subprocess-based providers must run in a thread.
+
+## 11. Change log
+
+| Version | Date | Change | Approved by |
+|---|---|---|---|
+| 1.0 | 2026-10-21 | First version, adapted from the unefy-platform FE ruleset v2.0 (WL-015): Python and React gate instead of Next.js, SonarQube and Jest; git, branches and worktrees dormant by owner decision; Trivy command for `uv.lock` and `package-lock.json`; tmux left out as in unefy v2.0. | Sheryar (asked for it, 2026-10-21) |
+| 1.1 | 2026-10-21 | pytest, ruff and ESLint join the gate (6.1, 6.2; WL-018, WL-019). | Sheryar (2026-10-21) |
+| 1.2 | 2026-10-22 | The portal is React + MUI only; the built-in UI is retired (9.1, 9.2, 9.3, 6.1; WL-047, decision 0008). | Sheryar ("yes", 2026-10-22) |
+| 1.3 | 2026-10-22 | No sub agents; the main chat does all items (2.1 to 2.4). | Sheryar ("yes", 2026-10-22) |
+| 1.4 | 2026-10-22 | Keep `frontend/dist` after the build check; FastAPI serves it (6.1; WL-050). | Sheryar ("proceed", 2026-10-22) |
+| 1.5 | 2026-10-24 | Trading memory: the chart method from Nadeem Gujjar's charts is binding for 4h and 1D analyses and for swing, position and hold back tests (12; WL-103). | Sheryar ("must be in the ruleset", 2026-10-24) |
+| 1.8 | 2026-10-29 | A price change up or down may use green and red too, always with ▲ or ▼ (9.3; WL-152, the watchlists). | Sheryar ("show green red colors of up or down", 2026-10-28) |
+| 1.7 | 2026-10-28 | Paper trade rules (12.6): 50 USDT margin at 10x and 20x, the entry must fill, liquidation on wicks, the target on a touch; Signals stop on a close, the Arena on a wick (WL-146 to WL-148). | Sheryar ("add this in ruleset", 2026-10-28) |
+| 1.6 | 2026-10-24 | Sheryar's own trades stay private (12.5): a private database and folder kept out of the share zip and the shared backups; only lessons without figures reach shared files. | Sheryar ("keep my losses confidential", 2026-10-24) |
+
+## 12. Trading memory (Required)
+
+12.1 The memory documents are [gujjar-charts.md](gujjar-charts.md) (the chart method and the setups read off Nadeem Gujjar's charts, in the `reference_setups` table) and [gujjar-v4.8.md](gujjar-v4.8.md) (his written rules), plus the Arena lessons ([arena/lessons.md](../arena/lessons.md)).
+
+12.2 Analysing: every 4h and 1D analysis prompt carries the chart method (`reference.prompt_block`), whatever the agent. A change to how analyses pick entries, stops or targets is checked against the stored setups first and the result written in the item.
+
+12.3 Back testing: swing, position and hold back tests use structure stops and measured-move final TPs as in 12.1, not ATR caps and fixed R (WL-104, WL-105). A strategy that cannot do that says so on its Strategies card.
+
+12.4 New charts or rules from Sheryar go into the memory documents and the database in the same item, with values exactly as printed; nothing is estimated.
+
+12.5 Sheryar's own trades are confidential; the project is shared with his team (Sheryar, 2026-10-24).
+- His trade history (exports, fills, PnL, balances, screenshots) lives only in `private/` at the repo root and in `backend/data/private.db`, never in `app.db`, `backups/*.db`, `docs/`, the work log, reports or memory notes. The share package (`scripts/share/package.ps1`) leaves both out and refuses a zip that carries them.
+- What his trades teach goes into shared rules only as a general rule with no figures, dates, coins, sizes or link back to him (for example "do not move the stop after entry", not "lost $X on SOL in May"). The figures and per-trade notes stay in `private/`.
+- Analyses may read his private lessons on his machine; on a machine without `private/` they run without them, with no error.
+- Chat answers to Sheryar may show his figures; anything written to a shared file may not. When unsure, ask before writing.
+
+12.6 Paper trades (Signals and the Arena) are judged the same way every time, so Sheryar does not have to repeat it (Sheryar, 2026-10-28; WL-146 to WL-148):
+- Size: 50 USDT margin, isolated, at 10x (a 500 USDT position) and 20x (1000 USDT). The Arena scores every trade at both, side by side; a signal uses the Paper defaults unless its own size was changed.
+- The entry must fill: nothing counts until price trades through the entry (an Arena trade enters at the next open, so it always fills; a signal entry within 0.5% of the price at the call fills at once).
+- Liquidation is on wicks, as on the exchange: a wick to the liquidation price before the stop loses the margin.
+- The target counts on a touch.
+- The stop: Signals on a candle close beyond it on the signal's timeframe (the Gujjar invalidation, WL-146); the Arena on a wick (Sheryar's choice, 2026-10-28).
+- Old Arena trades from before a rule change stay stored and tagged (decision 0010); the Arena pages show the current rules only, and the agents keep learning from both.

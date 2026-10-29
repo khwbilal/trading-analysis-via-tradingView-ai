@@ -1,0 +1,53 @@
+# Crypto Chart AI in Docker (WL-087). Start with setup.ps1 / setup.sh, or:
+#   docker compose up -d --build
+# Data lives in the named volume crypto-chart-ai-data and survives restarts, rebuilds
+# and `docker compose down`. Only `docker compose down -v` would remove it: never use -v.
+name: crypto-chart-ai
+
+x-app: &app
+  image: crypto-chart-ai:local
+  restart: unless-stopped
+  environment:
+    TZ: ${TZ:-Asia/Karachi}
+    # Docker's own daily backups, apart from backups/*.db (the seed, and the copies the
+    # start scripts' install writes), so neither overwrites the other.
+    BACKUP_DIR: /app/backups/docker
+  volumes:
+    - data:/app/backend/data
+    # BACKUP_HOST_DIR in the root .env moves this folder off the repo (WL-136), e.g. E:/crypto-chart-ai-backups
+    - ${BACKUP_HOST_DIR:-./backups}:/app/backups
+    - ./docs/arena:/app/docs/arena
+    # AI provider and keys; re-read on every request, so edits apply without a restart.
+    - ./backend/.env:/app/backend/.env
+
+services:
+  app:
+    <<: *app
+    build: .
+    ports:
+      # Only this computer can open it: the API has no login (ruleset 7.1).
+      - "127.0.0.1:${PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # The first start copies and checks the seed backup, which can take minutes.
+      start_period: 600s
+      start_interval: 5s
+
+  jobs:
+    <<: *app
+    # The image app builds; never pulled from a registry.
+    pull_policy: never
+    command: ["python", "/app/docker/scheduler.py"]
+    healthcheck:
+      disable: true
+    # Started after app is healthy (setup.ps1 / setup.sh), so only app seeds the database.
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  data:
+    name: crypto-chart-ai-data
